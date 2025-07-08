@@ -1,0 +1,8 @@
+# Never commit these!
+.env
+*.env
+config.json
+.vscode/
+__pycache__/
+*.pyc
+*.log
