@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Enhanced GroupMe-Discord Bridge - Complete with Bidirectional Replies
-FIXED: Reply detection works both ways (GroupMe↔Discord)
-Features: Ultra-fast messaging, deduplication, enhanced bidirectional replies
+Enhanced GroupMe-Discord Bridge - Single-Path Processing
+FIXED: Eliminates triple sends by using single processing path
+Features: Ultra-fast messaging, deduplication, bidirectional replies, NO DUPLICATES
 """
 
 import discord
@@ -28,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-print("🔥 BIDIRECTIONAL REPLY BRIDGE STARTING!")
+print("🔥 SINGLE-PATH PROCESSING BRIDGE STARTING!")
 
 # Environment Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -60,10 +60,10 @@ recent_messages = defaultdict(list)
 processed_messages = deque(maxlen=1000)
 message_timestamps = {}
 reply_context_cache = {}
+discord_message_cache = {}
 
-# Enhanced reply tracking
-discord_message_cache = {}  # Store Discord message content for reply lookup
-last_messages_by_user = defaultdict(dict)  # Track last message per user per platform
+# CRITICAL: Processing flags to prevent duplicate sends
+discord_processing_lock = {}  # Track messages being processed
 
 # Emoji mappings
 EMOJI_MAPPING = {
@@ -159,7 +159,7 @@ async def get_groupme_messages(group_id, before_id=None, limit=20):
         return response['data'].get('response', {}).get('messages', [])
     return []
 
-# ENHANCED Reply Detection Function
+# Enhanced Reply Detection Function
 async def detect_reply_context(data):
     """Enhanced bidirectional reply detection"""
     reply_context = None
@@ -172,17 +172,15 @@ async def detect_reply_context(data):
         )
         if reply_attachment:
             reply_id = reply_attachment.get('reply_id') or reply_attachment.get('base_reply_id')
-            if reply_id:
-                # Check if this is replying to a Discord-originated message
-                if reply_id in reply_context_cache:
-                    original_msg = reply_context_cache[reply_id]
-                    reply_context = {
-                        'text': original_msg.get('text', '[No text]'),
-                        'name': original_msg.get('name', 'Unknown'),
-                        'type': 'official_reply',
-                        'platform_source': 'groupme'
-                    }
-                    logger.info(f"✅ Found official GroupMe reply to {reply_context['name']}")
+            if reply_id and reply_id in reply_context_cache:
+                original_msg = reply_context_cache[reply_id]
+                reply_context = {
+                    'text': original_msg.get('text', '[No text]'),
+                    'name': original_msg.get('name', 'Unknown'),
+                    'type': 'official_reply',
+                    'platform_source': 'groupme'
+                }
+                logger.info(f"✅ Found official GroupMe reply to {reply_context['name']}")
     
     # Method 2: @mention detection with Discord user lookup
     if not reply_context and data.get('text'):
@@ -191,52 +189,29 @@ async def detect_reply_context(data):
         if mention_match:
             mentioned_name = mention_match.group(1).lower()
             
-            # First check if this @mention refers to a Discord user
-            # Look through recent Discord messages forwarded to GroupMe
-            for discord_msg_id, groupme_msg_id in message_mapping.items():
-                if discord_msg_id in discord_message_cache:
-                    discord_msg = discord_message_cache[discord_msg_id]
-                    if discord_msg['author'].lower().find(mentioned_name) >= 0:
-                        reply_context = {
-                            'text': discord_msg['content'],
-                            'name': discord_msg['author'],
-                            'type': 'mention_reply',
-                            'platform_source': 'discord'
-                        }
-                        logger.info(f"✅ Found @mention reply to Discord user {reply_context['name']}")
-                        break
-            
-            # If not found in Discord cache, check GroupMe messages
-            if not reply_context and GROUPME_ACCESS_TOKEN:
-                recent_msgs = await get_groupme_messages(data.get('group_id'), data.get('id'), 20)
-                for msg in recent_msgs:
-                    if (msg.get('name', '').lower().find(mentioned_name) >= 0 and 
-                        msg.get('id') != data.get('id') and
-                        msg.get('user_id') != data.get('user_id')):
-                        reply_context = {
-                            'text': msg.get('text', '[No text]'),
-                            'name': msg.get('name', 'Unknown'),
-                            'type': 'mention_reply',
-                            'platform_source': 'groupme'
-                        }
-                        logger.info(f"✅ Found @mention reply to GroupMe user {reply_context['name']}")
-                        break
+            # Check Discord message cache first
+            for discord_msg_id, cached_msg in discord_message_cache.items():
+                if cached_msg['author'].lower().find(mentioned_name) >= 0:
+                    reply_context = {
+                        'text': cached_msg['content'],
+                        'name': cached_msg['author'],
+                        'type': 'mention_reply',
+                        'platform_source': 'discord'
+                    }
+                    logger.info(f"✅ Found @mention reply to Discord user {reply_context['name']}")
+                    break
     
-    # Method 3: Quote pattern detection with cross-platform lookup
+    # Method 3: Quote pattern detection
     if not reply_context and data.get('text'):
         text = data['text']
-        quote_patterns = [
-            r'^>\s*(.+)',  # "> quoted text"
-            r'^"(.+?)"\s*',  # "quoted text"
-            r'^(.+?):\s*(.+)',  # "Name: message"
-        ]
+        quote_patterns = [r'^>\s*(.+)', r'^"(.+?)"\s*']
         
         for pattern in quote_patterns:
             match = re.search(pattern, text, re.MULTILINE)
             if match:
                 quoted_text = match.group(1).lower().strip()
                 
-                # First check Discord message cache
+                # Check Discord message cache
                 for discord_msg_id, cached_msg in discord_message_cache.items():
                     if cached_msg['content'].lower().find(quoted_text) >= 0:
                         reply_context = {
@@ -247,66 +222,40 @@ async def detect_reply_context(data):
                         }
                         logger.info(f"✅ Found quote reply to Discord message from {reply_context['name']}")
                         break
-                
-                # If not found in Discord, check GroupMe
-                if not reply_context and GROUPME_ACCESS_TOKEN:
-                    recent_msgs = await get_groupme_messages(data.get('group_id'), data.get('id'), 20)
-                    for msg in recent_msgs:
-                        if (msg.get('text', '').lower().find(quoted_text) >= 0 and
-                            msg.get('id') != data.get('id') and
-                            msg.get('user_id') != data.get('user_id')):
-                            reply_context = {
-                                'text': msg.get('text', '[No text]'),
-                                'name': msg.get('name', 'Unknown'),
-                                'type': 'quote_reply',
-                                'platform_source': 'groupme'
-                            }
-                            logger.info(f"✅ Found quote reply to GroupMe message from {reply_context['name']}")
-                            break
                 break
-    
-    # Method 4: Context-based detection (replying to recent message)
-    if not reply_context:
-        # Check if this user is likely replying to the most recent message
-        message_text = data.get('text', '').lower()
-        reply_indicators = ['yes', 'no', 'agreed', 'disagree', 'exactly', 'true', 'false', 'right', 'wrong', 'lol', 'haha']
-        
-        if any(indicator in message_text for indicator in reply_indicators):
-            # Find the most recent message that's not from this user
-            for discord_msg_id, cached_msg in reversed(list(discord_message_cache.items())[-5:]):  # Check last 5
-                if cached_msg['author'] != data.get('name', ''):
-                    reply_context = {
-                        'text': cached_msg['content'],
-                        'name': cached_msg['author'],
-                        'type': 'context_reply',
-                        'platform_source': 'discord'
-                    }
-                    logger.info(f"✅ Detected context reply to recent Discord message from {reply_context['name']}")
-                    break
     
     return reply_context
 
-# SINGLE GroupMe send function
-async def send_to_groupme(text, author_name=None, image_url=None, reply_context=None):
-    """SINGLE GroupMe send function with enhanced reply formatting"""
+# SINGLE GroupMe send function with processing lock
+async def send_to_groupme(text, author_name=None, image_url=None, reply_context=None, message_id=None):
+    """SINGLE GroupMe send function with duplicate prevention"""
     try:
+        # Create unique key for this send operation
+        send_key = f"{author_name}:{text[:50]}:{int(time.time())}"
+        
+        # Check if we're already processing this message
+        if message_id and message_id in discord_processing_lock:
+            logger.info(f"🚫 Already processing Discord message {message_id}, skipping duplicate send")
+            return True
+        
+        # Lock this message for processing
+        if message_id:
+            discord_processing_lock[message_id] = time.time()
+        
         # Enhanced reply context formatting
         if reply_context:
             quoted_text = reply_context.get('text', 'previous message')
             reply_author = reply_context.get('name', 'Someone')
             reply_type = reply_context.get('type', 'unknown')
+            platform_source = reply_context.get('platform_source', 'unknown')
             
             preview = quoted_text[:100] + '...' if len(quoted_text) > 100 else quoted_text
             
-            # Different formatting based on reply type
-            if reply_type == 'official_reply':
+            # Different formatting based on reply type and platform
+            if platform_source == 'discord':
+                text = f"↪️ **{author_name} replying to {reply_author}'s Discord message:**\n> {preview}\n\n{text}"
+            else:
                 text = f"↪️ **{author_name} replying to {reply_author}:**\n> {preview}\n\n{text}"
-            elif reply_type == 'mention_reply':
-                text = f"💬 **{author_name} @{reply_author}**: \"{preview}\"\n\n{text}"
-            elif reply_type == 'quote_reply':
-                text = f"💭 **{author_name} quoting {reply_author}**: \"{preview}\"\n\n{text}"
-            elif reply_type == 'context_reply':
-                text = f"🔗 **{author_name} responding to {reply_author}**: \"{preview}\"\n\n{text}"
         else:
             # Add author name if not already present
             if author_name and not text.startswith(author_name):
@@ -319,20 +268,27 @@ async def send_to_groupme(text, author_name=None, image_url=None, reply_context=
         
         response = await make_http_request(GROUPME_POST_URL, 'POST', payload)
         
+        # Clean up processing lock
+        if message_id and message_id in discord_processing_lock:
+            del discord_processing_lock[message_id]
+        
         if response['status'] == 202:
-            logger.info(f"✅ Message sent to GroupMe: {text[:50]}...")
+            logger.info(f"✅ SINGLE message sent to GroupMe: {text[:50]}...")
             return True
         else:
             logger.error(f"❌ Failed to send to GroupMe: {response['status']}")
             return False
             
     except Exception as e:
+        # Clean up processing lock on error
+        if message_id and message_id in discord_processing_lock:
+            del discord_processing_lock[message_id]
         logger.error(f"❌ Error sending to GroupMe: {e}")
         return False
 
-# ENHANCED Discord send function
+# Enhanced Discord send function
 async def send_to_discord(message, reply_context=None):
-    """Enhanced Discord send function with better reply formatting"""
+    """Enhanced Discord send function"""
     try:
         discord_channel = bot.get_channel(DISCORD_CHANNEL_ID)
         if not discord_channel:
@@ -342,35 +298,19 @@ async def send_to_discord(message, reply_context=None):
         content = message.get('text', '[No text content]')
         author = message.get('name', 'GroupMe User')
         
-        # Enhanced reply context formatting based on source platform
+        # Enhanced reply context formatting
         if reply_context:
             original_text = reply_context.get('text', '[No text]')
             original_author = reply_context.get('name', 'Unknown')
             reply_type = reply_context.get('type', 'unknown')
             platform_source = reply_context.get('platform_source', 'unknown')
             
-            # Create preview
             preview = original_text[:200] + '...' if len(original_text) > 200 else original_text
             
-            # Different formatting based on source platform and reply type
             if platform_source == 'discord':
-                # This is a GroupMe user replying to a Discord message
-                if reply_type == 'official_reply':
-                    content = f"↪️ **{author} replying to {original_author}'s Discord message:**\n> {preview}\n\n{content}"
-                elif reply_type == 'mention_reply':
-                    content = f"💬 **{author} @{original_author}** (from Discord): \"{preview}\"\n\n{content}"
-                elif reply_type == 'quote_reply':
-                    content = f"💭 **{author} quoting {original_author}** (from Discord): \"{preview}\"\n\n{content}"
-                elif reply_type == 'context_reply':
-                    content = f"🔗 **{author} responding to {original_author}** (from Discord): \"{preview}\"\n\n{content}"
+                content = f"↪️ **{author} replying to {original_author}'s Discord message:**\n> {preview}\n\n{content}"
             else:
-                # This is a GroupMe user replying to another GroupMe message
-                if reply_type == 'official_reply':
-                    content = f"↪️ **{author} replying to {original_author}:**\n> {preview}\n\n{content}"
-                elif reply_type == 'mention_reply':
-                    content = f"💬 **{author} @{original_author}**: \"{preview}\"\n\n{content}"
-                elif reply_type == 'quote_reply':
-                    content = f"💭 **{author} quoting {original_author}**: \"{preview}\"\n\n{content}"
+                content = f"↪️ **{author} replying to {original_author}:**\n> {preview}\n\n{content}"
         
         # Handle images
         embeds = []
@@ -398,7 +338,7 @@ async def send_to_discord(message, reply_context=None):
 
 # Webhook Server
 async def run_webhook_server():
-    """Clean webhook server with enhanced reply detection"""
+    """Clean webhook server"""
     
     async def health_check(request):
         return web.json_response({
@@ -406,17 +346,16 @@ async def run_webhook_server():
             "bot_ready": bot_status["ready"],
             "uptime": time.time() - bot_status["start_time"],
             "features": {
-                "deduplication": True,
-                "bidirectional_replies": True,
-                "ultra_fast": True,
-                "cross_platform_detection": True
+                "single_path_processing": True,
+                "no_duplicate_sends": True,
+                "bidirectional_replies": True
             },
             "processed_messages": len(processed_messages),
-            "discord_cache": len(discord_message_cache)
+            "processing_locks": len(discord_processing_lock)
         })
     
     async def groupme_webhook(request):
-        """SINGLE webhook handler with enhanced reply detection"""
+        """SINGLE webhook handler"""
         try:
             data = await request.json()
             sender_info = f"{data.get('name', 'Unknown')} ({data.get('sender_type', 'unknown')})"
@@ -436,7 +375,6 @@ async def run_webhook_server():
             
             # Handle reactions
             if data.get('favorited_by') and len(data['favorited_by']) > 0:
-                # Send reaction notification
                 if bot.is_ready():
                     asyncio.run_coroutine_threadsafe(
                         send_reaction_to_discord(data),
@@ -477,9 +415,8 @@ async def run_webhook_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    logger.info(f"🌐 Enhanced webhook server running on 0.0.0.0:{PORT}")
+    logger.info(f"🌐 Single-path webhook server running on 0.0.0.0:{PORT}")
     logger.info(f"🔗 GroupMe webhook: https://your-service.a.run.app/groupme")
-    logger.info(f"💬 Bidirectional reply detection: ✅")
     
     try:
         while True:
@@ -534,12 +471,12 @@ async def on_ready():
     logger.info(f'📺 Channel ID: {DISCORD_CHANNEL_ID}')
     logger.info(f'🖼️ Image support: {"✅" if GROUPME_ACCESS_TOKEN else "❌"}')
     logger.info(f'😀 Reaction support: {"✅" if GROUPME_ACCESS_TOKEN else "❌"}')
-    logger.info(f'💬 Bidirectional replies: ✅')
-    logger.info(f'⚡ Enhanced bridge ready!')
+    logger.info(f'🔒 Single-path processing: ✅')
+    logger.info(f'⚡ No duplicate sends: ✅')
 
 @bot.event
 async def on_message(message):
-    """Enhanced message handler with Discord message caching"""
+    """SINGLE-PATH message handler - CRITICAL FIX"""
     # Only process if not bot and in correct channel
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         await bot.process_commands(message)
@@ -548,6 +485,11 @@ async def on_message(message):
     # Skip commands
     if message.content.startswith('!'):
         await bot.process_commands(message)
+        return
+    
+    # CRITICAL: Check if already processing this message
+    if message.id in discord_processing_lock:
+        logger.info(f"🚫 Already processing Discord message {message.id}, ignoring duplicate")
         return
     
     logger.info(f"📨 Processing Discord message from {message.author.display_name}")
@@ -559,7 +501,7 @@ async def on_message(message):
         'timestamp': time.time()
     }
     
-    # Clean old cache entries (keep last 100)
+    # Clean old cache entries
     if len(discord_message_cache) > 100:
         old_keys = list(discord_message_cache.keys())[:-100]
         for key in old_keys:
@@ -576,7 +518,7 @@ async def on_message(message):
     if len(recent_messages[message.channel.id]) > 20:
         recent_messages[message.channel.id].pop(0)
     
-    # Detect reply context
+    # Detect reply context ONCE
     reply_context = None
     if message.reference and message.reference.message_id:
         try:
@@ -590,27 +532,39 @@ async def on_message(message):
         except:
             pass
     
-    # Handle content - SINGLE SEND ONLY
+    # SINGLE PROCESSING PATH - NO MULTIPLE SENDS
+    # Build the message content ONCE
+    message_content = message.content or ""
+    
+    # Handle attachments by adding to content
     if message.attachments:
+        attachment_info = []
         for attachment in message.attachments:
             if attachment.content_type and attachment.content_type.startswith('image/'):
+                attachment_info.append("[Image]")
                 logger.info(f"🖼️ Processing image: {attachment.filename}")
-                await send_to_groupme(
-                    message.content or "[Image]", 
-                    message.author.display_name, 
-                    None,  # No image URL conversion for now
-                    reply_context
-                )
             else:
-                await send_to_groupme(
-                    f"{message.content} [Attached: {attachment.filename}]",
-                    message.author.display_name,
-                    reply_context=reply_context
-                )
-    elif message.content.strip():
-        await send_to_groupme(message.content, message.author.display_name, reply_context=reply_context)
+                attachment_info.append(f"[Attached: {attachment.filename}]")
+        
+        if attachment_info:
+            if message_content:
+                message_content = f"{message_content} {' '.join(attachment_info)}"
+            else:
+                message_content = ' '.join(attachment_info)
+    
+    # SINGLE SEND CALL - This is the only place we send to GroupMe
+    if message_content.strip():
+        await send_to_groupme(
+            message_content, 
+            message.author.display_name, 
+            None,  # No image URL for now
+            reply_context,
+            message.id  # Pass message ID for duplicate prevention
+        )
         if reply_context:
-            logger.info(f"⚡ Discord reply sent to GroupMe")
+            logger.info(f"⚡ SINGLE Discord reply sent to GroupMe")
+        else:
+            logger.info(f"⚡ SINGLE Discord message sent to GroupMe")
     
     # Process commands at the end
     await bot.process_commands(message)
@@ -626,28 +580,20 @@ async def on_reaction_add(reaction, user):
     logger.info(f"😀 Processing reaction {emoji} from {user.display_name}")
     
     # Send reaction to GroupMe
-    discord_msg_id = reaction.message.id
-    if discord_msg_id in message_mapping:
-        # Reaction to GroupMe message
-        original_content = reaction.message.content[:50] if reaction.message.content else "a message"
-        context = f"'{original_content}...'"
-    else:
-        # Reaction to Discord message
-        original_author = reaction.message.author.display_name
-        original_content = reaction.message.content[:50] if reaction.message.content else "a message"
-        context = f"'{original_content}...' by {original_author}"
+    original_content = reaction.message.content[:50] if reaction.message.content else "a message"
+    context = f"'{original_content}...'"
     
     reaction_text = f"{user.display_name} reacted {emoji} to {context}"
-    await send_to_groupme(reaction_text)
+    await send_to_groupme(reaction_text, message_id=f"reaction_{reaction.message.id}")
 
-# Enhanced Bot Commands
+# Bot Commands
 @bot.command(name='status')
 async def status(ctx):
-    """Enhanced status with bidirectional reply info"""
+    """Single-path status command"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    status_msg = f"""🟢 **Enhanced Bridge Status**
+    status_msg = f"""🟢 **Single-Path Bridge Status**
 🔗 GroupMe Bot: {'✅' if GROUPME_BOT_ID else '❌'}
 🔑 Access Token: {'✅' if GROUPME_ACCESS_TOKEN else '❌'}
 😀 Reactions: {'✅' if GROUPME_ACCESS_TOKEN else '❌'}
@@ -655,18 +601,15 @@ async def status(ctx):
 ⚡ **INSTANT Messaging: ✅**
 🚫 **No Duplicates: ✅**
 💬 **Bidirectional Replies: ✅**
-🔄 **Cross-Platform Detection: ✅**
+🔒 **Single-Path Processing: ✅**
 
 📝 Processed Messages: {len(processed_messages)}
 💬 Message Mappings: {len(message_mapping)}
 🔗 Reply Cache: {len(reply_context_cache)}
 💾 Discord Cache: {len(discord_message_cache)}
+🔒 Processing Locks: {len(discord_processing_lock)}
 
-**Reply Detection Methods:**
-• Official replies ✅
-• @mention cross-platform ✅  
-• Quote patterns ✅
-• Context detection ✅"""
+**FIXED: No more triple sends!**"""
     
     await ctx.send(status_msg)
 
@@ -676,72 +619,60 @@ async def test_bridge(ctx):
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    await send_to_groupme("🧪 Enhanced bridge test with bidirectional replies!", ctx.author.display_name)
-    await ctx.send("✅ Test message sent to GroupMe!")
+    await send_to_groupme("🧪 Single-path test - no more triple sends!", ctx.author.display_name, message_id=f"test_{ctx.message.id}")
+    await ctx.send("✅ SINGLE test message sent to GroupMe!")
 
 @bot.command(name='testreply')
 async def test_reply_detection(ctx):
-    """Test the enhanced bidirectional reply detection"""
+    """Test reply detection"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    # Send a test message to GroupMe
-    await send_to_groupme("🧪 **Test Reply Detection** - Try replying to this message in GroupMe using @mention or quotes!", "Reply Test Bot")
-    
-    # Send a test message in Discord
-    test_msg = await ctx.send("🧪 **Test Message** - Reply to this in Discord to test Discord→GroupMe replies!")
-    
-    await ctx.send("""✅ **Bidirectional Reply Test Setup Complete!**
-
-**Test Discord → GroupMe:**
-Reply to this Discord message → Should show in GroupMe with context
-
-**Test GroupMe → Discord:**
-• Use `@username` → Should show in Discord with "from Discord" context  
-• Quote with `"> text"` → Should show in Discord with quote context
-• Simple replies like "yes" → Should detect context automatically
-
-Check the logs for reply detection confirmations! 🔍""")
+    test_msg = await ctx.send("🧪 **Reply Test** - Reply to this message to test single-path reply processing!")
+    await ctx.send("✅ Reply to the message above - it should send only ONCE to GroupMe!")
 
 @bot.command(name='debug')
 async def debug_info(ctx):
-    """Show debug information with bidirectional reply tracking"""
+    """Show debug information"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    debug_msg = f"""🔍 **Bidirectional Debug Information**
+    debug_msg = f"""🔍 **Single-Path Debug Information**
 **Environment:**
 • Discord Token: {'✅' if DISCORD_BOT_TOKEN else '❌'}
 • GroupMe Bot ID: {'✅' if GROUPME_BOT_ID else '❌'}
 • Channel ID: {DISCORD_CHANNEL_ID}
 
-**Bidirectional Reply System:**
-• Discord→GroupMe replies: ✅
-• GroupMe→Discord replies: ✅
-• Cross-platform detection: ✅
-• Discord message cache: {len(discord_message_cache)} messages
-• Platform source tracking: ✅
+**Single-Path Architecture:**
+• One message processor: ✅
+• One send function: ✅
+• Processing locks: ✅
+• Duplicate prevention: ✅
 
 **Active Data:**
 • Message Mappings: {len(message_mapping)}
-• GroupMe→Discord: {len(groupme_to_discord)}
 • Processed Messages: {len(processed_messages)}
-• Reply Cache: {len(reply_context_cache)}
+• Discord Cache: {len(discord_message_cache)}
+• Processing Locks: {len(discord_processing_lock)}
 
-**Detection Methods Working:**
-• Official Discord replies: ✅
-• GroupMe @mentions to Discord users: ✅  
-• Quote detection cross-platform: ✅
-• Context-based detection: ✅"""
+**FIXED: Triple send issue eliminated!**"""
     
     await ctx.send(debug_msg)
 
 # Cleanup Task
 async def cleanup_old_data():
-    """Enhanced periodic cleanup"""
+    """Enhanced cleanup with processing lock cleanup"""
     while True:
         try:
             current_time = time.time()
+            
+            # Clean old processing locks (older than 5 minutes)
+            old_locks = [
+                msg_id for msg_id, timestamp in discord_processing_lock.items()
+                if current_time - timestamp > 300
+            ]
+            for msg_id in old_locks:
+                del discord_processing_lock[msg_id]
             
             # Clean old mappings
             if len(message_mapping) > 1000:
@@ -750,7 +681,7 @@ async def cleanup_old_data():
                     message_mapping.pop(key, None)
                     groupme_to_discord.pop(message_mapping.get(key), None)
             
-            # Clean old Discord message cache
+            # Clean old Discord cache
             if len(discord_message_cache) > 100:
                 old_keys = list(discord_message_cache.keys())[:-100]
                 for key in old_keys:
@@ -770,7 +701,7 @@ async def cleanup_old_data():
 
 # Main Function
 def main():
-    """Enhanced main entry point with bidirectional replies"""
+    """Single-path main entry point"""
     if not DISCORD_BOT_TOKEN:
         logger.error("❌ DISCORD_BOT_TOKEN required!")
         return
@@ -783,9 +714,9 @@ def main():
         logger.error("❌ DISCORD_CHANNEL_ID required!")
         return
     
-    logger.info("🚀 Starting ENHANCED GroupMe-Discord Bridge...")
-    logger.info("💬 Bidirectional reply detection enabled!")
-    logger.info("🔄 Cross-platform reply context tracking!")
+    logger.info("🚀 Starting SINGLE-PATH GroupMe-Discord Bridge...")
+    logger.info("🔒 Processing locks enabled to prevent triple sends!")
+    logger.info("⚡ Single processing path for all messages!")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
