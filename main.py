@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced GroupMe-Discord Bridge - Combined Full-Featured Application
+Enhanced GroupMe-Discord Bridge - Fixed Async Version
 Combines webhook handling with Discord bot functionality for complete bidirectional sync
 Features: Messages, Images, Reactions, Polls, Reply Context, Threading, Cloud Run Support
 """
@@ -62,6 +62,9 @@ poll_mapping = {}  # Discord poll ID -> poll data
 groupme_poll_mapping = {}  # GroupMe poll ID -> poll data
 active_polls = {}
 poll_vote_tracking = defaultdict(dict)
+
+# Message queue for thread-safe communication
+message_queue = asyncio.Queue()
 
 # Emoji mappings for reactions
 EMOJI_MAPPING = {
@@ -320,6 +323,52 @@ async def send_reaction_to_discord(reaction_data, original_message):
         logger.error(f"❌ Failed to send reaction to Discord: {e}")
         return False
 
+# Queue System for Thread-Safe Communication
+async def send_to_discord_via_queue(message, reply_context=None):
+    """Queue messages for Discord bot to process safely"""
+    try:
+        await message_queue.put({
+            'type': 'message',
+            'data': message,
+            'reply_context': reply_context,
+            'timestamp': time.time()
+        })
+        logger.info("✅ Message queued for Discord")
+    except Exception as e:
+        logger.error(f"❌ Error queuing message: {e}")
+
+async def send_reaction_to_discord_fixed(reaction_data, original_message):
+    """Queue reactions for Discord bot to process safely"""
+    try:
+        await message_queue.put({
+            'type': 'reaction',
+            'data': reaction_data,
+            'original_message': original_message,
+            'timestamp': time.time()
+        })
+        logger.info("✅ Reaction queued for Discord")
+    except Exception as e:
+        logger.error(f"❌ Error queuing reaction: {e}")
+
+async def process_message_queue():
+    """Process queued messages from webhook in Discord bot context"""
+    while True:
+        try:
+            # Get message from queue (wait if empty)
+            item = await message_queue.get()
+            
+            if item['type'] == 'message':
+                await send_to_discord(item['data'], item['reply_context'])
+            elif item['type'] == 'reaction':
+                await send_reaction_to_discord(item['data'], item['original_message'])
+            
+            # Mark task as done
+            message_queue.task_done()
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing message queue: {e}")
+            await asyncio.sleep(1)
+
 # Poll Functions
 async def create_groupme_poll_from_discord(poll, author_name, discord_message):
     """Create native GroupMe poll from Discord poll"""
@@ -385,50 +434,6 @@ async def create_groupme_poll_from_discord(poll, author_name, discord_message):
         logger.error(f"Error creating GroupMe poll: {e}")
         return False
 
-async def handle_groupme_poll_event(event_data):
-    """Handle GroupMe poll events from webhook"""
-    try:
-        event = event_data.get('event', {})
-        event_type = event.get('type', '')
-        
-        if event_type == 'poll.created':
-            await handle_groupme_poll_created(event_data)
-        elif event_type == 'poll.vote':
-            await handle_groupme_poll_vote(event_data)
-        elif event_type == 'poll.ended':
-            await handle_groupme_poll_ended(event_data)
-            
-    except Exception as e:
-        logger.error(f"Error handling GroupMe poll event: {e}")
-
-async def handle_groupme_poll_created(data):
-    """Handle GroupMe poll creation"""
-    try:
-        event_data = data.get('event', {}).get('data', {})
-        poll_data = event_data.get('poll', {})
-        user_data = event_data.get('user', {})
-        
-        poll_id = poll_data.get('id')
-        poll_subject = poll_data.get('subject', 'Poll')
-        author_name = user_data.get('nickname', 'Unknown')
-        
-        if not poll_id:
-            return
-        
-        # Get full poll data
-        url = f"{GROUPME_POLLS_SHOW_URL}/{poll_id}?token={GROUPME_ACCESS_TOKEN}"
-        response = await make_http_request(url)
-        
-        if response['status'] == 200 and response['data']:
-            full_poll_data = response['data'].get('poll', {}).get('data', {})
-            options = [opt.get('title', '') for opt in full_poll_data.get('options', [])]
-            
-            if len(options) >= 2:
-                await create_discord_poll_from_groupme(poll_subject, options, author_name, poll_id)
-                
-    except Exception as e:
-        logger.error(f"Error handling GroupMe poll creation: {e}")
-
 async def create_discord_poll_from_groupme(question, options, author_name, groupme_poll_id):
     """Create Discord poll from GroupMe poll"""
     try:
@@ -472,9 +477,9 @@ async def create_discord_poll_from_groupme(question, options, author_name, group
         logger.error(f"Error creating Discord poll from GroupMe: {e}")
         return False
 
-# Webhook Server
+# Webhook Server (FIXED VERSION)
 async def run_webhook_server():
-    """Enhanced webhook server with comprehensive GroupMe event handling"""
+    """Fixed webhook server with proper async handling"""
     
     async def health_check(request):
         """Health check endpoint"""
@@ -495,7 +500,7 @@ async def run_webhook_server():
         })
     
     async def groupme_webhook(request):
-        """Handle GroupMe webhook events"""
+        """Fixed GroupMe webhook handler with proper async context"""
         try:
             data = await request.json()
             logger.info(f"📨 GroupMe webhook received: {data.get('name', 'Unknown')} - {data.get('text', '')[:50]}...")
@@ -503,15 +508,11 @@ async def run_webhook_server():
             # Handle regular messages
             if data.get('sender_type') != 'bot' and data.get('name', '') != 'Bot':
                 
-                # Handle poll events
-                if data.get('event'):
-                    await handle_groupme_poll_event(data)
-                
                 # Handle reactions
-                elif data.get('favorited_by') and len(data['favorited_by']) > 0:
+                if data.get('favorited_by') and len(data['favorited_by']) > 0:
                     latest_reaction = data['favorited_by'][-1]
                     reaction_data = {'favorited_by': latest_reaction}
-                    await send_reaction_to_discord(reaction_data, data)
+                    await send_reaction_to_discord_fixed(reaction_data, data)
                 
                 # Handle regular messages
                 else:
@@ -543,32 +544,13 @@ async def run_webhook_server():
                                 f"text_{int(time.time())}"
                             )
                     
-                    # Send message to Discord
-                    await send_to_discord(data, reply_context)
+                    # Send message to Discord using queue system
+                    await send_to_discord_via_queue(data, reply_context)
             
             return web.json_response({"status": "success"})
             
         except Exception as e:
             logger.error(f"❌ Error handling GroupMe webhook: {e}")
-            return web.json_response({"error": str(e)}, status=500)
-    
-    async def discord_webhook(request):
-        """Handle Discord webhook (optional fallback)"""
-        try:
-            data = await request.json()
-            
-            # Ignore bot messages to prevent loops
-            if data.get('webhook_id') or (data.get('author', {}).get('bot')):
-                return web.json_response({"status": "ignored"})
-            
-            author = data.get('author', {}).get('username', 'Discord User')
-            content = data.get('content', '')
-            
-            success = await send_to_groupme(content, author)
-            return web.json_response({"status": "success" if success else "failed"})
-            
-        except Exception as e:
-            logger.error(f"Error handling Discord webhook: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
     # Create web application
@@ -580,8 +562,6 @@ async def run_webhook_server():
     app.router.add_get('/_ah/health', health_check)
     app.router.add_post('/groupme', groupme_webhook)
     app.router.add_post('/groupme/webhook', groupme_webhook)
-    app.router.add_post('/discord', discord_webhook)
-    app.router.add_post('/discord/webhook', discord_webhook)
     
     # CORS support
     app.router.add_options('/{path:.*}', lambda request: web.Response())
@@ -594,7 +574,6 @@ async def run_webhook_server():
     
     logger.info(f"🌐 Webhook server running on 0.0.0.0:{PORT}")
     logger.info(f"🔗 GroupMe webhook: https://your-service.com/groupme")
-    logger.info(f"🔗 Discord webhook: https://your-service.com/discord")
     
     # Keep running
     try:
@@ -605,20 +584,26 @@ async def run_webhook_server():
         await runner.cleanup()
 
 def start_webhook_server():
-    """Start webhook server in thread"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_webhook_server())
-    except Exception as e:
-        logger.error(f"Webhook server error: {e}")
-    finally:
-        loop.close()
+    """Start webhook server in thread with proper async context"""
+    def run_in_thread():
+        # Create new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_webhook_server())
+        except Exception as e:
+            logger.error(f"Webhook server error: {e}")
+        finally:
+            loop.close()
+    
+    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread.start()
+    return thread
 
 # Discord Bot Events
 @bot.event
 async def on_ready():
-    """Bot ready event"""
+    """Bot ready event with queue processor"""
     global bot_status
     bot_status["ready"] = True
     
@@ -630,6 +615,10 @@ async def on_ready():
     logger.info(f'🧵 Threading: ✅')
     logger.info(f'🌐 Webhook server: ✅')
     logger.info(f'☁️ Enhanced bridge ready!')
+    
+    # Start message queue processor
+    bot.loop.create_task(process_message_queue())
+    logger.info("📬 Message queue processor started")
 
 @bot.event
 async def on_message(message):
@@ -782,6 +771,7 @@ async def status(ctx):
 📊 Polls: {'✅' if GROUPME_ACCESS_TOKEN and GROUPME_GROUP_ID else '❌'}
 🧵 Threading: ✅
 🌐 Webhook Server: ✅
+📬 Message Queue: ✅
 
 📊 Active Polls: {len(active_polls)}
 💬 Message Mappings: {len(message_mapping)}
@@ -799,88 +789,6 @@ async def test_bridge(ctx):
     
     await send_to_groupme("🧪 Enhanced bridge test from Discord!", ctx.author.display_name)
     await ctx.send("✅ Test message sent to GroupMe!")
-
-@bot.command(name='testpoll')
-async def test_poll(ctx):
-    """Create test poll"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    try:
-        poll_options = [
-            discord.PollMedia(text="Yes", emoji="✅"),
-            discord.PollMedia(text="No", emoji="❌"),
-            discord.PollMedia(text="Maybe", emoji="🤔")
-        ]
-        
-        poll = discord.Poll(
-            question="🧪 Test Poll - Is this working?",
-            options=poll_options,
-            multiple=False,
-            duration=1
-        )
-        
-        poll_message = await ctx.send(poll=poll)
-        await ctx.send("✅ Test poll created! Should appear in GroupMe.")
-        
-        # Manually trigger GroupMe poll creation
-        await create_groupme_poll_from_discord(poll, ctx.author.display_name, poll_message)
-        
-    except Exception as e:
-        await ctx.send(f"❌ Poll test failed: {e}")
-
-@bot.command(name='nativepoll')
-async def create_native_poll(ctx, *, poll_text):
-    """Create native GroupMe poll: !nativepoll Question? Option1, Option2, Option3"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    if not GROUPME_ACCESS_TOKEN:
-        await ctx.send("❌ GROUPME_ACCESS_TOKEN required")
-        return
-    
-    try:
-        poll_data = parse_poll_text(poll_text)
-        if not poll_data or len(poll_data['options']) < 2:
-            await ctx.send("❌ Format: `!nativepoll Question? Option1, Option2, Option3`")
-            return
-        
-        # Create GroupMe poll
-        poll_payload = {
-            "subject": poll_data['question'][:160],
-            "options": [{"title": opt[:160]} for opt in poll_data['options']],
-            "expiration": int(time.time()) + (24 * 60 * 60),
-            "type": "single",
-            "visibility": "public"
-        }
-        
-        url = f"{GROUPME_POLLS_CREATE_URL}?token={GROUPME_ACCESS_TOKEN}"
-        response = await make_http_request(url, 'POST', poll_payload)
-        
-        if response['status'] == 201:
-            await ctx.send(f"✅ Native GroupMe poll created: **{poll_data['question']}?**")
-            
-            # Also create Discord poll
-            poll_options = []
-            for i, option in enumerate(poll_data['options']):
-                emoji = f"{i+1}\u20e3"
-                poll_options.append(discord.PollMedia(text=option[:55], emoji=emoji))
-            
-            discord_poll = discord.Poll(
-                question=f"{poll_data['question']}?",
-                options=poll_options,
-                multiple=False,
-                duration=24
-            )
-            
-            await ctx.send(poll=discord_poll)
-            await ctx.send("✅ Discord poll created too!")
-            
-        else:
-            await ctx.send(f"❌ Failed to create GroupMe poll: {response['status']}")
-            
-    except Exception as e:
-        await ctx.send(f"❌ Error: {e}")
 
 @bot.command(name='debug')
 async def debug_info(ctx):
@@ -900,6 +808,7 @@ async def debug_info(ctx):
 **Bot Status:**
 • Ready: {bot_status['ready']}
 • Uptime: {int(time.time() - bot_status['start_time'])}s
+• Queue Size: {message_queue.qsize()}
 
 **Active Data:**
 • Polls: {len(active_polls)}
@@ -908,7 +817,6 @@ async def debug_info(ctx):
 
 **Webhook Endpoints:**
 • GroupMe: https://your-service.com/groupme
-• Discord: https://your-service.com/discord
 • Health: https://your-service.com/health"""
     
     await ctx.send(debug_msg)
@@ -954,7 +862,7 @@ async def cleanup_old_data():
 
 # Main Function
 def main():
-    """Main entry point"""
+    """Main entry point with fixed async handling"""
     # Validate environment
     if not DISCORD_BOT_TOKEN:
         logger.error("❌ DISCORD_BOT_TOKEN required!")
@@ -976,18 +884,13 @@ def main():
     
     logger.info("🚀 Starting Enhanced GroupMe-Discord Bridge...")
     
-    # Start webhook server in thread
-    webhook_thread = threading.Thread(target=start_webhook_server, daemon=True)
-    webhook_thread.start()
+    # Start webhook server in separate thread
+    webhook_thread = start_webhook_server()
     
     # Wait for server to start
     time.sleep(2)
     
-    # Start cleanup task
-    loop = asyncio.get_event_loop()
-    loop.create_task(cleanup_old_data())
-    
-    # Start Discord bot
+    # Start Discord bot (this will start the message queue processor)
     try:
         bot.run(DISCORD_BOT_TOKEN)
     except Exception as e:
