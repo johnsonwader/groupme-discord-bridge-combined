@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-print("🔥 SIMPLIFIED BIDIRECTIONAL BRIDGE WITH DISCORD NICKNAMES STARTING!")
+print("🔥 SIMPLIFIED BIDIRECTIONAL BRIDGE WITH DISCORD NICKNAMES & MENTION CONVERSION STARTING!")
 
 # Environment Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -205,15 +205,77 @@ async def detect_reply_context(data):
     
     return reply_context
 
-# ENHANCED send_to_groupme function - ALWAYS use Discord nicknames, never usernames
-async def send_to_groupme(text, author_name=None, reply_context=None):
-    """Enhanced GroupMe send function - ensures ONLY Discord nicknames are shown"""
+# Discord mention conversion function
+async def convert_discord_mentions_to_nicknames(text):
+    """Convert Discord mentions (<@123456>) to readable nicknames (@Nick Nanosky)"""
+    if not text or not bot.is_ready():
+        return text
+    
     try:
-        # Enhanced reply context formatting - ensure we ONLY show Discord nicknames
+        # Pattern to match Discord mentions: <@123456> or <@!123456>
+        mention_pattern = r'<@!?(\d+)>'
+        mentions = re.findall(mention_pattern, text)
+        
+        if not mentions:
+            return text
+        
+        # Track replacements for logging
+        replacements_made = []
+        
+        for user_id in mentions:
+            try:
+                # Get the Discord user object
+                user = bot.get_user(int(user_id))
+                if not user:
+                    # Try fetching if not in cache
+                    user = await bot.fetch_user(int(user_id))
+                
+                if user:
+                    # Use display name (nickname) if available, otherwise username
+                    display_name = getattr(user, 'display_name', user.name)
+                    
+                    # Replace the mention with a readable format
+                    original_mention = f'<@{user_id}>'
+                    nickname_mention = f'<@!{user_id}>'
+                    readable_mention = f'@{display_name}'
+                    
+                    # Replace both possible mention formats
+                    text = text.replace(original_mention, readable_mention)
+                    text = text.replace(nickname_mention, readable_mention)
+                    
+                    replacements_made.append(f"{original_mention} → @{display_name}")
+                    logger.info(f"🏷️  Converted mention: {user_id} → @{display_name}")
+                else:
+                    logger.warning(f"⚠️  Could not find Discord user with ID: {user_id}")
+                    
+            except Exception as e:
+                logger.error(f"❌ Error converting mention for user ID {user_id}: {e}")
+                continue
+        
+        if replacements_made:
+            logger.info(f"✅ Converted {len(replacements_made)} Discord mentions to nicknames")
+        
+        return text
+        
+    except Exception as e:
+        logger.error(f"❌ Error in mention conversion: {e}")
+        return text
+
+# ENHANCED send_to_groupme function - Convert Discord mentions AND use nicknames
+async def send_to_groupme(text, author_name=None, reply_context=None):
+    """Enhanced GroupMe send function - converts Discord mentions and ensures ONLY Discord nicknames are shown"""
+    try:
+        # STEP 1: Convert Discord mentions to readable nicknames
+        text = await convert_discord_mentions_to_nicknames(text)
+        
+        # STEP 2: Enhanced reply context formatting - ensure we ONLY show Discord nicknames
         if reply_context:
             quoted_text = reply_context.get('text', 'previous message')
             reply_author = reply_context.get('name', 'Someone')  # This MUST be display_name only
             preview = quoted_text[:100] + '...' if len(quoted_text) > 100 else quoted_text
+            
+            # Also convert mentions in the quoted text
+            preview = await convert_discord_mentions_to_nicknames(preview)
             
             # Clean formatting for GroupMe - just show the Discord nickname
             text = f"↪️ **{author_name} replying to {reply_author}:**\n> {preview}\n\n{text}"
@@ -302,7 +364,8 @@ async def run_webhook_server():
                 "simplified_processing": True,
                 "minimal_duplicate_prevention": True,
                 "bidirectional_replies": True,
-                "discord_nicknames_only": True
+                "discord_nicknames_only": True,
+                "discord_mention_conversion": True
             },
             "processed_messages": len(processed_message_ids),
             "reply_cache_size": len(reply_context_cache)
@@ -430,11 +493,12 @@ async def on_ready():
     logger.info(f'⚡ Minimal duplicate prevention: ✅')
     logger.info(f'🔄 Bidirectional replies: ✅')
     logger.info(f'🏷️  Discord nicknames only: ✅')
+    logger.info(f'🔗 Discord mention conversion: ✅')
 
-# ENHANCED Discord message handler - ALWAYS use nicknames for GroupMe
+# ENHANCED Discord message handler - Convert mentions AND use nicknames for GroupMe
 @bot.event
 async def on_message(message):
-    """ENHANCED message handler - ensures ONLY Discord nicknames appear on GroupMe"""
+    """ENHANCED message handler - converts Discord mentions and ensures ONLY Discord nicknames appear on GroupMe"""
     # Basic filters only
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         await bot.process_commands(message)
@@ -451,6 +515,10 @@ async def on_message(message):
     
     logger.info(f"📨 Processing Discord message from '{discord_nickname}' (username: {discord_username})")
     logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
+    
+    # Check for Discord mentions that will be converted
+    if '<@' in message.content:
+        logger.info(f"🔗 Message contains Discord mentions - will be converted to nicknames")
     
     # Enhanced Discord message tracking - store ONLY the display_name for GroupMe use
     discord_msg_data = {
@@ -495,7 +563,7 @@ async def on_message(message):
             else:
                 message_content = ' '.join(attachment_info)
     
-    # Send to GroupMe using ONLY the display_name (nickname) - never username
+    # Send to GroupMe using ONLY the display_name (nickname) - mentions will be converted automatically
     if message_content.strip():
         await send_to_groupme(message_content, discord_nickname, reply_context)
         logger.info(f"⚡ Message sent to GroupMe showing nickname: '{discord_nickname}'")
@@ -539,12 +607,14 @@ async def status(ctx):
 ⚡ **Minimal Filtering: ✅**
 🔄 **Bidirectional Replies: ✅**
 🏷️  **Discord Nicknames Only: ✅**
+🔗 **Discord Mention Conversion: ✅**
 
 📝 Recent Message IDs: {len(processed_message_ids)}
 💬 Message Mappings: {len(message_mapping)}
 🔗 Reply Cache: {len(reply_context_cache)}
 
-**Enhanced - Discord nicknames (not usernames) appear on GroupMe!**"""
+**Enhanced - Discord mentions (@user) converted to nicknames on GroupMe!**
+*Example: `<@567521619334135828>` → `@Danoush Paborji`*"""
     
     await ctx.send(status_msg)
 
@@ -566,6 +636,28 @@ async def test_send(ctx, *, message="Test message from Discord"):
         await ctx.send(f"✅ Test message sent to GroupMe as '{discord_nickname}'!")
     else:
         await ctx.send("❌ Failed to send test message to GroupMe")
+
+@bot.command(name='testmention')
+async def test_mention(ctx):
+    """Test Discord mention conversion"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        await ctx.send("❌ This command only works in the bridged channel")
+        return
+    
+    discord_nickname = ctx.author.display_name
+    test_message = f"Hey {ctx.author.mention}, this mention will be converted to your nickname on GroupMe!"
+    
+    logger.info(f"🧪 Testing mention conversion for '{discord_nickname}'")
+    logger.info(f"🔗 Original: {test_message}")
+    
+    converted_message = await convert_discord_mentions_to_nicknames(test_message)
+    logger.info(f"🔗 Converted: {converted_message}")
+    
+    success = await send_to_groupme(test_message, "Bot Test", None)
+    if success:
+        await ctx.send(f"✅ Mention test sent! Your Discord mention was converted to '@{discord_nickname}' on GroupMe.")
+    else:
+        await ctx.send("❌ Failed to send mention test to GroupMe")
 
 # Simple cleanup task
 async def simple_cleanup():
@@ -609,6 +701,7 @@ def main():
     logger.info("⚡ Minimal duplicate prevention!")
     logger.info("🔄 Simple bidirectional replies!")
     logger.info("🏷️  Discord nicknames only on GroupMe!")
+    logger.info("🔗 Discord mention conversion enabled!")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
