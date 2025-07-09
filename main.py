@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simplified GroupMe-Discord Bridge - Reduced Duplicate Prevention
-Features: Fast messaging, bidirectional replies, minimal filtering
+Simplified GroupMe-Discord Bridge - Enhanced with Discord Nickname Support
+Features: Fast messaging, bidirectional replies, minimal filtering, Discord nicknames only
 """
 
 import discord
@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-print("🔥 SIMPLIFIED BIDIRECTIONAL BRIDGE STARTING!")
+print("🔥 SIMPLIFIED BIDIRECTIONAL BRIDGE WITH DISCORD NICKNAMES STARTING!")
 
 # Environment Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -51,8 +51,8 @@ bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 bot_status = {"ready": False, "start_time": time.time()}
 message_mapping = {}  # Discord message ID -> GroupMe message ID
 reply_context_cache = {}  # Store messages for reply detection
-recent_discord_messages = deque(maxlen=20)  # Reduced size
-recent_groupme_messages = deque(maxlen=20)  # Reduced size
+recent_discord_messages = deque(maxlen=20)  # Store Discord messages with nicknames
+recent_groupme_messages = deque(maxlen=20)  # Store GroupMe messages
 
 # SIMPLIFIED deduplication - much less aggressive
 processed_message_ids = deque(maxlen=100)  # Just track recent message IDs
@@ -134,9 +134,9 @@ async def get_groupme_messages(group_id, limit=20):
         return response['data'].get('response', {}).get('messages', [])
     return []
 
-# Simplified reply detection
+# Enhanced reply detection with better nickname matching
 async def detect_reply_context(data):
-    """Simplified reply detection"""
+    """Enhanced reply detection with better Discord nickname matching"""
     reply_context = None
     
     # Method 1: Official GroupMe reply attachments
@@ -156,38 +156,70 @@ async def detect_reply_context(data):
                 }
                 logger.info(f"✅ Found official reply to {reply_context['name']}")
     
-    # Method 2: Simple @mention detection
+    # Method 2: Enhanced @mention detection with nickname support
     if not reply_context and data.get('text'):
         text = data['text']
         mention_match = re.search(r'@(\w+)', text, re.IGNORECASE)
         if mention_match:
             mentioned_name = mention_match.group(1).lower()
             
-            # Check recent Discord messages
+            # Check recent Discord messages with enhanced matching
             for discord_msg in reversed(recent_discord_messages):
-                if mentioned_name in discord_msg['author'].lower():
+                # Check against display name (nickname) first, then username
+                display_name = discord_msg['author'].lower()
+                username = discord_msg.get('username', '').lower()
+                
+                if (mentioned_name in display_name or 
+                    mentioned_name in username or
+                    mentioned_name == display_name or
+                    mentioned_name == username):
+                    
                     reply_context = {
                         'text': discord_msg['content'],
-                        'name': discord_msg['author'],
+                        'name': discord_msg['author'],  # This is the display_name (nickname)
                         'type': 'mention_reply'
                     }
-                    logger.info(f"✅ Found @mention reply to {reply_context['name']}")
+                    logger.info(f"✅ Found @mention reply to {reply_context['name']} (Discord nickname)")
                     break
+    
+    # Method 3: Enhanced contextual reply detection
+    if not reply_context and data.get('text'):
+        text = data['text'].lower()
+        
+        # Look for common reply patterns mentioning Discord users
+        for discord_msg in reversed(list(recent_discord_messages)[-5:]):  # Check last 5 messages
+            display_name = discord_msg['author'].lower()
+            username = discord_msg.get('username', '').lower()
+            
+            # Check if the GroupMe message seems to be responding to this Discord user
+            if (display_name in text or username in text or
+                any(word in text for word in [display_name.split()[0], username.split()[0]] if word)):
+                
+                reply_context = {
+                    'text': discord_msg['content'],
+                    'name': discord_msg['author'],  # Display name (nickname)
+                    'type': 'contextual_reply'
+                }
+                logger.info(f"✅ Found contextual reply to {reply_context['name']} (Discord nickname)")
+                break
     
     return reply_context
 
-# SIMPLIFIED GroupMe send function - removed most locks and checks
+# ENHANCED send_to_groupme function - ALWAYS use Discord nicknames, never usernames
 async def send_to_groupme(text, author_name=None, reply_context=None):
-    """Simplified GroupMe send function"""
+    """Enhanced GroupMe send function - ensures ONLY Discord nicknames are shown"""
     try:
-        # Enhanced reply context formatting
+        # Enhanced reply context formatting - ensure we ONLY show Discord nicknames
         if reply_context:
             quoted_text = reply_context.get('text', 'previous message')
-            reply_author = reply_context.get('name', 'Someone')
+            reply_author = reply_context.get('name', 'Someone')  # This MUST be display_name only
             preview = quoted_text[:100] + '...' if len(quoted_text) > 100 else quoted_text
+            
+            # Clean formatting for GroupMe - just show the Discord nickname
             text = f"↪️ **{author_name} replying to {reply_author}:**\n> {preview}\n\n{text}"
+            logger.info(f"✅ Formatted GroupMe reply showing Discord nickname: {reply_author}")
         else:
-            # Add author name if not already present
+            # Add author name if not already present - use ONLY the display_name (nickname)
             if author_name and not text.startswith(author_name):
                 text = f"{author_name}: {text}" if text.strip() else f"{author_name} sent content"
         
@@ -195,7 +227,7 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
         response = await make_http_request(GROUPME_POST_URL, 'POST', payload)
         
         if response['status'] == 202:
-            logger.info(f"✅ Message sent to GroupMe: {text[:50]}...")
+            logger.info(f"✅ Message sent to GroupMe using nickname '{author_name}': {text[:50]}...")
             return True
         else:
             logger.error(f"❌ Failed to send to GroupMe: {response['status']}")
@@ -205,9 +237,9 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
         logger.error(f"❌ Error sending to GroupMe: {e}")
         return False
 
-# Simplified Discord send function
+# Enhanced send_to_discord function with better reply formatting
 async def send_to_discord(message, reply_context=None):
-    """Simplified Discord send function"""
+    """Enhanced Discord send function with nickname-aware reply formatting"""
     try:
         discord_channel = bot.get_channel(DISCORD_CHANNEL_ID)
         if not discord_channel:
@@ -217,12 +249,17 @@ async def send_to_discord(message, reply_context=None):
         content = message.get('text', '[No text content]')
         author = message.get('name', 'GroupMe User')
         
-        # Reply context formatting
+        # Enhanced reply context formatting - ONLY show Discord nicknames, never usernames
         if reply_context:
             original_text = reply_context.get('text', '[No text]')
-            original_author = reply_context.get('name', 'Unknown')
+            original_author = reply_context.get('name', 'Unknown')  # This should be display_name only
             preview = original_text[:200] + '...' if len(original_text) > 200 else original_text
-            content = f"↪️ **{author} replying to {original_author}:**\n> {preview}\n\n{content}"
+            
+            # Clean formatting - just show the nickname without extra labels
+            reply_type = reply_context.get('type', 'reply')
+            content = f"↪️ **{author}** replying to **{original_author}**:\n> {preview}\n\n{content}"
+            
+            logger.info(f"✅ Formatted reply to Discord user nickname: {original_author}")
         
         # Handle images
         embeds = []
@@ -235,10 +272,15 @@ async def send_to_discord(message, reply_context=None):
         formatted_content = f"**{author}:** {content}" if content else f"**{author}** sent an attachment"
         sent_message = await discord_channel.send(formatted_content, embeds=embeds)
         
-        # Simple mapping storage
+        # Enhanced mapping storage with Discord user tracking - store ONLY display_name
         if message.get('id'):
             message_mapping[sent_message.id] = message['id']
-            reply_context_cache[message['id']] = message
+            # Store with enhanced metadata for better reply tracking
+            reply_context_cache[message['id']] = {
+                **message,
+                'discord_message_id': sent_message.id,
+                'processed_timestamp': time.time()
+            }
         
         logger.info(f"✅ Message sent to Discord: {content[:50]}...")
         return True
@@ -259,7 +301,8 @@ async def run_webhook_server():
             "features": {
                 "simplified_processing": True,
                 "minimal_duplicate_prevention": True,
-                "bidirectional_replies": True
+                "bidirectional_replies": True,
+                "discord_nicknames_only": True
             },
             "processed_messages": len(processed_message_ids),
             "reply_cache_size": len(reply_context_cache)
@@ -386,10 +429,12 @@ async def on_ready():
     logger.info(f'🔒 Simplified processing: ✅')
     logger.info(f'⚡ Minimal duplicate prevention: ✅')
     logger.info(f'🔄 Bidirectional replies: ✅')
+    logger.info(f'🏷️  Discord nicknames only: ✅')
 
+# ENHANCED Discord message handler - ALWAYS use nicknames for GroupMe
 @bot.event
 async def on_message(message):
-    """SIMPLIFIED message handler - much less filtering"""
+    """ENHANCED message handler - ensures ONLY Discord nicknames appear on GroupMe"""
     # Basic filters only
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         await bot.process_commands(message)
@@ -400,27 +445,35 @@ async def on_message(message):
         await bot.process_commands(message)
         return
     
-    logger.info(f"📨 Processing Discord message from {message.author.display_name}")
+    # Get the Discord display name (nickname) - this is what will appear on GroupMe
+    discord_nickname = message.author.display_name
+    discord_username = message.author.name
     
-    # Simple Discord message tracking
+    logger.info(f"📨 Processing Discord message from '{discord_nickname}' (username: {discord_username})")
+    logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
+    
+    # Enhanced Discord message tracking - store ONLY the display_name for GroupMe use
     discord_msg_data = {
         'content': message.content,
-        'author': message.author.display_name,
-        'timestamp': time.time()
+        'author': discord_nickname,  # PRIMARY: Display name (nickname) for GroupMe
+        'username': discord_username,        # INTERNAL: Username for matching only
+        'author_id': message.author.id,         # For precise matching
+        'timestamp': time.time(),
+        'message_id': message.id
     }
     recent_discord_messages.append(discord_msg_data)
     
-    # Simple reply detection
+    # Simple reply detection - ensure we use display_name in reply context
     reply_context = None
     if message.reference and message.reference.message_id:
         try:
             replied_message = await message.channel.fetch_message(message.reference.message_id)
             reply_context = {
                 'text': replied_message.content[:200],
-                'name': replied_message.author.display_name,
+                'name': replied_message.author.display_name,  # ONLY display_name (nickname)
                 'type': 'official_reply'
             }
-            logger.info(f"✅ Found Discord reply to {reply_context['name']}")
+            logger.info(f"✅ Found Discord reply to nickname: '{reply_context['name']}'")
         except:
             pass
     
@@ -442,59 +495,75 @@ async def on_message(message):
             else:
                 message_content = ' '.join(attachment_info)
     
-    # Send to GroupMe (simplified - no locks or complex checks)
+    # Send to GroupMe using ONLY the display_name (nickname) - never username
     if message_content.strip():
-        await send_to_groupme(message_content, message.author.display_name, reply_context)
-        logger.info(f"⚡ Message sent to GroupMe from {message.author.display_name}")
+        await send_to_groupme(message_content, discord_nickname, reply_context)
+        logger.info(f"⚡ Message sent to GroupMe showing nickname: '{discord_nickname}'")
+        logger.info(f"   (NOT showing username: '{discord_username}')")
     
     await bot.process_commands(message)
 
+# ENHANCED reaction handling - ALWAYS use Discord nicknames on GroupMe
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Handle reaction additions"""
+    """Handle reaction additions - ensures ONLY Discord nicknames appear on GroupMe"""
     if (user.bot or reaction.message.channel.id != DISCORD_CHANNEL_ID):
         return
     
     emoji = str(reaction.emoji)
-    logger.info(f"😀 Processing reaction {emoji} from {user.display_name}")
+    discord_nickname = user.display_name
+    discord_username = user.name
     
-    # Send reaction to GroupMe
+    logger.info(f"😀 Processing reaction {emoji} from '{discord_nickname}' (username: {discord_username})")
+    logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
+    
+    # Send reaction to GroupMe using ONLY display_name (nickname) - never username
     original_content = reaction.message.content[:50] if reaction.message.content else "a message"
-    reaction_text = f"{user.display_name} reacted {emoji} to '{original_content}...'"
-    await send_to_groupme(reaction_text)
+    reaction_text = f"{discord_nickname} reacted {emoji} to '{original_content}...'"
+    
+    await send_to_groupme(reaction_text, discord_nickname)
+    logger.info(f"✅ Reaction sent to GroupMe showing nickname: '{discord_nickname}'")
+    logger.info(f"   (NOT showing username: '{discord_username}')")
 
-# Simplified Bot Commands
+# Enhanced Bot Commands
 @bot.command(name='status')
 async def status(ctx):
-    """Simplified status command"""
+    """Enhanced status command"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    status_msg = f"""🟢 **Simplified Bridge Status**
+    status_msg = f"""🟢 **Enhanced Bridge Status**
 🔗 GroupMe Bot: {'✅' if GROUPME_BOT_ID else '❌'}
 🔑 Access Token: {'✅' if GROUPME_ACCESS_TOKEN else '❌'}
 🌐 Webhook Server: ✅
 ⚡ **Minimal Filtering: ✅**
 🔄 **Bidirectional Replies: ✅**
+🏷️  **Discord Nicknames Only: ✅**
 
 📝 Recent Message IDs: {len(processed_message_ids)}
 💬 Message Mappings: {len(message_mapping)}
 🔗 Reply Cache: {len(reply_context_cache)}
 
-**Simplified - Less aggressive duplicate prevention!**"""
+**Enhanced - Discord nicknames (not usernames) appear on GroupMe!**"""
     
     await ctx.send(status_msg)
 
 @bot.command(name='test')
 async def test_send(ctx, *, message="Test message from Discord"):
-    """Test sending a message to GroupMe"""
+    """Test sending a message to GroupMe - uses Discord nickname"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         await ctx.send("❌ This command only works in the bridged channel")
         return
     
-    success = await send_to_groupme(message, ctx.author.display_name)
+    discord_nickname = ctx.author.display_name
+    discord_username = ctx.author.name
+    
+    logger.info(f"🧪 Test command from '{discord_nickname}' (username: {discord_username})")
+    logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
+    
+    success = await send_to_groupme(message, discord_nickname)
     if success:
-        await ctx.send("✅ Test message sent to GroupMe!")
+        await ctx.send(f"✅ Test message sent to GroupMe as '{discord_nickname}'!")
     else:
         await ctx.send("❌ Failed to send test message to GroupMe")
 
@@ -523,7 +592,7 @@ async def simple_cleanup():
 
 # Main Function
 def main():
-    """Simplified main entry point"""
+    """Enhanced main entry point"""
     if not DISCORD_BOT_TOKEN:
         logger.error("❌ DISCORD_BOT_TOKEN required!")
         return
@@ -536,9 +605,10 @@ def main():
         logger.error("❌ DISCORD_CHANNEL_ID required!")
         return
     
-    logger.info("🚀 Starting SIMPLIFIED GroupMe-Discord Bridge...")
+    logger.info("🚀 Starting ENHANCED GroupMe-Discord Bridge...")
     logger.info("⚡ Minimal duplicate prevention!")
     logger.info("🔄 Simple bidirectional replies!")
+    logger.info("🏷️  Discord nicknames only on GroupMe!")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
