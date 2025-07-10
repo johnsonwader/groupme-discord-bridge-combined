@@ -81,9 +81,18 @@ health_stats = {
     "messages_failed": 0,
     "last_success": time.time(),
     "last_failure": None,
-    "queue_size": 0
+    "queue_size": 0,
+    "last_sync_check": None,
+    "sync_discrepancies": 0
 }
 health_stats_lock = threading.Lock()
+
+# Message reconciliation tracking
+message_history = {
+    "discord": deque(maxlen=100),  # Store recent Discord messages
+    "groupme": deque(maxlen=100)   # Store recent GroupMe messages
+}
+history_lock = threading.Lock()
 
 # Message retry configuration
 MAX_RETRIES = 3
@@ -224,6 +233,258 @@ async def get_groupme_messages(group_id, limit=20):
         return response['data'].get('response', {}).get('messages', [])
     return []
 
+async def get_discord_messages(channel_id, limit=20):
+    """Get recent Discord messages from channel"""
+    try:
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            return []
+        
+        messages = []
+        async for message in channel.history(limit=limit):
+            if not message.author.bot:  # Skip bot messages
+                messages.append({
+                    'id': str(message.id),
+                    'content': message.content,
+                    'author': message.author.display_name,
+                    'timestamp': message.created_at.timestamp(),
+                    'has_attachments': len(message.attachments) > 0
+                })
+        return messages
+    except Exception as e:
+        logger.error(f"Error fetching Discord messages: {e}")
+        return []
+
+def normalize_message_content(content):
+    """Normalize message content for comparison"""
+    if not content:
+        return ""
+    
+    # Remove formatting and normalize
+    normalized = content.lower().strip()
+    
+    # Remove common bridge prefixes
+    patterns = [
+        r'^[\w\s]+:\s*',  # "Username: " prefix
+        r'^\*\*[\w\s]+\*\*:\s*',  # "**Username**: " prefix
+        r'^↪️\s*\*\*[\w\s]+.*?\*\*.*?\n',  # Reply formatting
+    ]
+    
+    for pattern in patterns:
+        normalized = re.sub(pattern, '', normalized, flags=re.MULTILINE)
+    
+    # Remove extra whitespace
+    normalized = ' '.join(normalized.split())
+    
+    return normalized
+
+def messages_match(msg1_content, msg2_content, threshold=0.85):
+    """Check if two messages are likely the same using fuzzy matching"""
+    # Normalize both messages
+    norm1 = normalize_message_content(msg1_content)
+    norm2 = normalize_message_content(msg2_content)
+    
+    if not norm1 or not norm2:
+        return False
+    
+    # Exact match after normalization
+    if norm1 == norm2:
+        return True
+    
+    # Check if one contains the other (for truncated messages)
+    if norm1 in norm2 or norm2 in norm1:
+        return True
+    
+    # Simple similarity check (Jaccard similarity)
+    words1 = set(norm1.split())
+    words2 = set(norm2.split())
+    
+    if not words1 or not words2:
+        return False
+    
+    intersection = words1.intersection(words2)
+    union = words1.union(words2)
+    
+    similarity = len(intersection) / len(union) if union else 0
+    
+    return similarity >= threshold
+
+async def check_message_sync(lookback_minutes=10, limit=50):
+    """Check if messages are properly synced between platforms"""
+    try:
+        logger.info(f"🔍 Starting message sync check (last {lookback_minutes} minutes)")
+        
+        # Get recent messages from both platforms
+        groupme_messages = await get_groupme_messages(GROUPME_GROUP_ID, limit=limit)
+        discord_messages = await get_discord_messages(DISCORD_CHANNEL_ID, limit=limit)
+        
+        # Filter messages within time window
+        current_time = time.time()
+        time_window = lookback_minutes * 60
+        
+        recent_groupme = [
+            msg for msg in groupme_messages 
+            if current_time - msg.get('created_at', 0) < time_window
+        ]
+        
+        recent_discord = [
+            msg for msg in discord_messages
+            if current_time - msg.get('timestamp', 0) < time_window
+        ]
+        
+        # Track unmatched messages
+        unmatched_groupme = []
+        unmatched_discord = []
+        matched_pairs = []
+        
+        # Check GroupMe messages that should be in Discord
+        for gm_msg in recent_groupme:
+            # Skip bot messages
+            if gm_msg.get('sender_type') == 'bot':
+                continue
+                
+            gm_content = gm_msg.get('text', '')
+            gm_author = gm_msg.get('name', '')
+            found_match = False
+            
+            for disc_msg in recent_discord:
+                disc_content = disc_msg.get('content', '')
+                
+                # Check if content matches
+                if messages_match(gm_content, disc_content):
+                    found_match = True
+                    matched_pairs.append((gm_msg, disc_msg))
+                    break
+            
+            if not found_match and gm_content:
+                unmatched_groupme.append(gm_msg)
+                logger.warning(f"📍 GroupMe message not found in Discord: '{gm_author}: {gm_content[:50]}...'")
+        
+        # Check Discord messages that should be in GroupMe
+        for disc_msg in recent_discord:
+            disc_content = disc_msg.get('content', '')
+            disc_author = disc_msg.get('author', '')
+            found_match = False
+            
+            # Skip if already matched
+            if any(disc_msg == pair[1] for pair in matched_pairs):
+                continue
+            
+            for gm_msg in recent_groupme:
+                gm_content = gm_msg.get('text', '')
+                
+                if messages_match(disc_content, gm_content):
+                    found_match = True
+                    break
+            
+            if not found_match and disc_content:
+                unmatched_discord.append(disc_msg)
+                logger.warning(f"📍 Discord message not found in GroupMe: '{disc_author}: {disc_content[:50]}...'")
+        
+        # Update health stats
+        with health_stats_lock:
+            health_stats["last_sync_check"] = current_time
+            health_stats["sync_discrepancies"] = len(unmatched_groupme) + len(unmatched_discord)
+        
+        # Prepare report
+        report = {
+            "checked_at": current_time,
+            "time_window_minutes": lookback_minutes,
+            "groupme_messages": len(recent_groupme),
+            "discord_messages": len(recent_discord),
+            "matched_messages": len(matched_pairs),
+            "unmatched_groupme": unmatched_groupme,
+            "unmatched_discord": unmatched_discord,
+            "sync_rate": len(matched_pairs) / max(len(recent_groupme), len(recent_discord), 1) * 100
+        }
+        
+        logger.info(f"✅ Sync check complete: {report['sync_rate']:.1f}% sync rate")
+        
+        return report
+        
+    except Exception as e:
+        logger.error(f"❌ Error during sync check: {e}")
+        return None
+
+async def resync_missing_messages(report):
+    """Attempt to resync any missing messages found during sync check"""
+    try:
+        resynced_count = 0
+        
+        # Resync GroupMe messages missing from Discord
+        for gm_msg in report.get('unmatched_groupme', []):
+            logger.info(f"🔄 Resyncing GroupMe message to Discord: {gm_msg.get('name')}: {gm_msg.get('text', '')[:50]}...")
+            
+            # Queue the message for Discord
+            await message_queue.put({
+                'send_func': send_to_discord,
+                'kwargs': {'message': gm_msg, 'reply_context': None},
+                'type': 'resync_groupme_to_discord',
+                'retries': 0
+            })
+            resynced_count += 1
+            
+            # Small delay to avoid overwhelming
+            await asyncio.sleep(0.5)
+        
+        # Resync Discord messages missing from GroupMe
+        for disc_msg in report.get('unmatched_discord', []):
+            logger.info(f"🔄 Resyncing Discord message to GroupMe: {disc_msg.get('author')}: {disc_msg.get('content', '')[:50]}...")
+            
+            # Queue the message for GroupMe
+            await message_queue.put({
+                'send_func': send_to_groupme,
+                'kwargs': {
+                    'text': disc_msg.get('content', ''),
+                    'author_name': disc_msg.get('author', 'Discord User'),
+                    'reply_context': None
+                },
+                'type': 'resync_discord_to_groupme',
+                'retries': 0
+            })
+            resynced_count += 1
+            
+            await asyncio.sleep(0.5)
+        
+        logger.info(f"✅ Queued {resynced_count} messages for resync")
+        return resynced_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error during resync: {e}")
+        return 0
+
+async def periodic_sync_check():
+    """Periodically check message sync between platforms"""
+    await asyncio.sleep(300)  # Wait 5 minutes after startup
+    
+    while True:
+        try:
+            # Run sync check
+            report = await check_message_sync(lookback_minutes=15, limit=50)
+            
+            if report:
+                sync_rate = report['sync_rate']
+                discrepancies = len(report['unmatched_groupme']) + len(report['unmatched_discord'])
+                
+                if discrepancies > 0:
+                    logger.warning(f"⚠️  Found {discrepancies} unsynced messages (sync rate: {sync_rate:.1f}%)")
+                    
+                    # Auto-resync if enabled
+                    if discrepancies <= 10:  # Only auto-resync if reasonable number
+                        logger.info("🔄 Auto-resyncing missing messages...")
+                        await resync_missing_messages(report)
+                    else:
+                        logger.warning(f"⚠️  Too many discrepancies ({discrepancies}), manual intervention may be needed")
+                else:
+                    logger.info(f"✅ All messages synced properly (100% sync rate)")
+            
+            # Wait before next check (default 15 minutes)
+            await asyncio.sleep(900)
+            
+        except Exception as e:
+            logger.error(f"❌ Periodic sync check error: {e}")
+            await asyncio.sleep(900)
+
 # Enhanced reply detection
 async def detect_reply_context(data):
     """Enhanced reply detection with better Discord nickname matching"""
@@ -343,6 +604,15 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
         
         if success:
             logger.info(f"✅ Message sent to GroupMe: {text[:50]}...")
+            
+            # Track in message history for sync checking
+            with history_lock:
+                message_history["discord"].append({
+                    'content': text,
+                    'author': author_name,
+                    'timestamp': time.time(),
+                    'synced_to_groupme': True
+                })
         else:
             logger.error(f"❌ Failed to send to GroupMe: {response['status']}")
             
@@ -392,6 +662,16 @@ async def send_to_discord(message, reply_context=None):
                     'discord_message_id': sent_message.id,
                     'processed_timestamp': time.time()
                 }
+        
+        # Track in message history for sync checking
+        with history_lock:
+            message_history["groupme"].append({
+                'id': message.get('id'),
+                'content': message.get('text', ''),
+                'author': author,
+                'timestamp': message.get('created_at', time.time()),
+                'synced_to_discord': True
+            })
         
         update_health_stats(True)
         logger.info(f"✅ Message sent to Discord: {content[:50]}...")
@@ -455,6 +735,11 @@ async def run_webhook_server():
         with health_stats_lock:
             stats = health_stats.copy()
         
+        # Format last sync check
+        last_sync_formatted = "Never"
+        if stats.get("last_sync_check"):
+            last_sync_formatted = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats["last_sync_check"]))
+        
         return web.json_response({
             "status": "healthy",
             "bot_ready": bot_status["ready"],
@@ -465,13 +750,23 @@ async def run_webhook_server():
                 "health_monitoring": True,
                 "persistence": True,
                 "thread_safety": True,
+                "sync_checking": True,
                 "discord_nicknames_only": True,
                 "discord_mention_conversion": True
             },
             "health_stats": stats,
+            "sync_status": {
+                "last_check": last_sync_formatted,
+                "discrepancies": stats.get("sync_discrepancies", 0),
+                "check_interval_minutes": 15
+            },
             "processed_messages": len(processed_message_ids),
             "reply_cache_size": len(reply_context_cache),
-            "failed_messages": len(failed_messages)
+            "failed_messages": len(failed_messages),
+            "message_history": {
+                "discord": len(message_history.get("discord", [])),
+                "groupme": len(message_history.get("groupme", []))
+            }
         })
     
     async def groupme_webhook(request):
@@ -579,9 +874,13 @@ async def on_ready():
     logger.info(f'💾 Persistence: ✅')
     logger.info(f'🔒 Thread safety: ✅')
     logger.info(f'📊 Health monitoring: ✅')
+    logger.info(f'🔍 Sync checking: ✅')
     
     # Start the message queue processor
     asyncio.create_task(message_queue_processor())
+    
+    # Start periodic sync checker
+    asyncio.create_task(periodic_sync_check())
     
     # Load and retry any failed messages
     failed = load_failed_messages()
@@ -715,6 +1014,12 @@ async def health_monitor():
             else:
                 success_rate = 100
             
+            # Format last sync check
+            sync_status = "Never checked"
+            if stats.get("last_sync_check"):
+                time_since = int(time.time() - stats["last_sync_check"])
+                sync_status = f"{time_since // 60}m ago, {stats.get('sync_discrepancies', 0)} discrepancies"
+            
             logger.info(f"""
 📊 BRIDGE HEALTH REPORT:
 ✅ Messages sent: {stats["messages_sent"]}
@@ -722,12 +1027,17 @@ async def health_monitor():
 📈 Success rate: {success_rate:.1f}%
 📬 Queue size: {stats["queue_size"]}
 💾 Failed messages: {len(failed_messages)}
+🔍 Last sync check: {sync_status}
 ⏰ Last success: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats["last_success"]))}
             """)
             
             # Alert if failure rate is high
             if success_rate < 90 and total_messages > 10:
                 logger.warning(f"⚠️  High failure rate detected: {100-success_rate:.1f}%")
+            
+            # Alert if sync discrepancies are high
+            if stats.get("sync_discrepancies", 0) > 5:
+                logger.warning(f"⚠️  High sync discrepancies: {stats['sync_discrepancies']} messages out of sync")
             
             # Save failed messages periodically
             save_failed_messages()
@@ -767,7 +1077,7 @@ async def enhanced_cleanup():
 # Bot Commands
 @bot.command(name='status')
 async def status(ctx):
-    """Enhanced status command with health stats"""
+    """Enhanced status command with health and sync stats"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
@@ -776,6 +1086,11 @@ async def status(ctx):
     
     total_messages = stats["messages_sent"] + stats["messages_failed"]
     success_rate = (stats["messages_sent"] / total_messages * 100) if total_messages > 0 else 100
+    
+    # Format last sync check time
+    last_sync = "Never"
+    if stats["last_sync_check"]:
+        last_sync = time.strftime('%H:%M:%S', time.localtime(stats["last_sync_check"]))
     
     status_msg = f"""🟢 **Enhanced Bridge Status**
 🔗 GroupMe Bot: {'✅' if GROUPME_BOT_ID else '❌'}
@@ -789,12 +1104,17 @@ async def status(ctx):
 📬 Queue size: {stats["queue_size"]}
 💾 Failed messages: {len(failed_messages)}
 
+**🔍 Sync Status:**
+⏰ Last sync check: {last_sync}
+⚠️  Discrepancies found: {stats["sync_discrepancies"]}
+
 **🔧 Enhanced Features:**
 📬 Message Queue: ✅
 🔄 Retry Logic: ✅ (max {MAX_RETRIES} attempts)
 💾 Persistence: ✅
 🔒 Thread Safety: ✅
 📊 Health Monitoring: ✅
+🔍 Sync Checking: ✅ (every 15 min)
 🏷️ Discord Nicknames: ✅
 🔗 Mention Conversion: ✅
 
@@ -803,6 +1123,178 @@ async def status(ctx):
 🔗 Reply Cache: {len(reply_context_cache)}"""
     
     await ctx.send(status_msg)
+
+@bot.command(name='sync')
+async def manual_sync_check(ctx, minutes: int = 10):
+    """Manually check message sync"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    if minutes < 1 or minutes > 60:
+        await ctx.send("❌ Please specify minutes between 1 and 60")
+        return
+    
+    await ctx.send(f"🔍 Checking message sync for the last {minutes} minutes...")
+    
+    # Run sync check
+    report = await check_message_sync(lookback_minutes=minutes, limit=100)
+    
+    if not report:
+        await ctx.send("❌ Sync check failed. Check logs for details.")
+        return
+    
+    # Create detailed report
+    embed = discord.Embed(
+        title="🔍 Message Sync Report",
+        color=discord.Color.green() if report['sync_rate'] > 95 else discord.Color.orange()
+    )
+    
+    embed.add_field(
+        name="📊 Overview",
+        value=f"Sync Rate: **{report['sync_rate']:.1f}%**\n"
+              f"Time Window: {report['time_window_minutes']} minutes\n"
+              f"Matched Messages: {report['matched_messages']}",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📈 Platform Messages",
+        value=f"GroupMe: {report['groupme_messages']}\n"
+              f"Discord: {report['discord_messages']}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="⚠️  Discrepancies",
+        value=f"Missing from Discord: {len(report['unmatched_groupme'])}\n"
+              f"Missing from GroupMe: {len(report['unmatched_discord'])}",
+        inline=True
+    )
+    
+    # List some unmatched messages
+    if report['unmatched_groupme']:
+        missing_gm = []
+        for msg in report['unmatched_groupme'][:3]:  # Show first 3
+            text = msg.get('text', '[No text]')[:50]
+            author = msg.get('name', 'Unknown')
+            missing_gm.append(f"• {author}: {text}...")
+        
+        embed.add_field(
+            name="❌ Missing from Discord",
+            value="\n".join(missing_gm) or "None",
+            inline=False
+        )
+    
+    if report['unmatched_discord']:
+        missing_dc = []
+        for msg in report['unmatched_discord'][:3]:  # Show first 3
+            text = msg.get('content', '[No text]')[:50]
+            author = msg.get('author', 'Unknown')
+            missing_dc.append(f"• {author}: {text}...")
+        
+        embed.add_field(
+            name="❌ Missing from GroupMe",
+            value="\n".join(missing_dc) or "None",
+            inline=False
+        )
+    
+    await ctx.send(embed=embed)
+    
+    # Ask about resyncing if there are discrepancies
+    total_missing = len(report['unmatched_groupme']) + len(report['unmatched_discord'])
+    if total_missing > 0:
+        await ctx.send(f"Found {total_missing} unsynced messages. Use `!resync` to attempt to sync them.")
+
+@bot.command(name='resync')
+async def manual_resync(ctx):
+    """Manually resync missing messages from last sync check"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    await ctx.send("🔄 Starting resync process...")
+    
+    # Run a fresh sync check first
+    report = await check_message_sync(lookback_minutes=15, limit=100)
+    
+    if not report:
+        await ctx.send("❌ Sync check failed. Cannot resync.")
+        return
+    
+    total_missing = len(report['unmatched_groupme']) + len(report['unmatched_discord'])
+    
+    if total_missing == 0:
+        await ctx.send("✅ No missing messages found. Everything is already synced!")
+        return
+    
+    if total_missing > 20:
+        await ctx.send(f"⚠️  Found {total_missing} missing messages. This is a lot! Proceeding with caution...")
+    
+    # Perform resync
+    resynced = await resync_missing_messages(report)
+    
+    await ctx.send(f"✅ Queued {resynced} messages for resync. Check status in a few moments.")
+
+@bot.command(name='syncstats')
+async def sync_statistics(ctx):
+    """Show detailed sync statistics"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    # Run a quick sync check
+    report = await check_message_sync(lookback_minutes=5, limit=50)
+    
+    if not report:
+        await ctx.send("❌ Unable to generate sync statistics")
+        return
+    
+    with health_stats_lock:
+        last_check = health_stats.get("last_sync_check")
+        total_discrepancies = health_stats.get("sync_discrepancies", 0)
+    
+    embed = discord.Embed(
+        title="📊 Sync Statistics",
+        color=discord.Color.blue()
+    )
+    
+    # Current sync status
+    embed.add_field(
+        name="🔍 Current Status",
+        value=f"Sync Rate: **{report['sync_rate']:.1f}%**\n"
+              f"Last 5 min: {report['matched_messages']}/{report['groupme_messages']} messages",
+        inline=False
+    )
+    
+    # Historical data
+    if last_check:
+        time_since = int(time.time() - last_check)
+        mins = time_since // 60
+        secs = time_since % 60
+        embed.add_field(
+            name="⏰ Last Full Check",
+            value=f"{mins}m {secs}s ago\n"
+                  f"Found {total_discrepancies} discrepancies",
+            inline=True
+        )
+    
+    # Recommendations
+    if report['sync_rate'] < 90:
+        embed.add_field(
+            name="⚠️  Recommendations",
+            value="• Check network connectivity\n"
+                  "• Verify API credentials\n"
+                  "• Run `!resync` to fix missing messages\n"
+                  "• Check logs for errors",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="✅ Health",
+            value="Bridge is operating normally\n"
+                  f"Automatic sync checks every 15 minutes",
+            inline=False
+        )
+    
+    await ctx.send(embed=embed)
 
 @bot.command(name='retry')
 async def retry_failed(ctx):
@@ -875,6 +1367,9 @@ def main():
     logger.info("💾 Persistence enabled!")
     logger.info("🔒 Thread safety enabled!")
     logger.info("📊 Health monitoring enabled!")
+    logger.info("🔍 Sync checking enabled! (every 15 minutes)")
+    logger.info("🏷️ Discord nicknames enabled!")
+    logger.info("🔗 Discord mention conversion enabled!")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
