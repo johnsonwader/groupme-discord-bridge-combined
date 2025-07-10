@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Simplified GroupMe-Discord Bridge - Enhanced with Discord Nickname Support
-Features: Fast messaging, bidirectional replies, minimal filtering, Discord nicknames only
+Enhanced GroupMe-Discord Bridge with Reliability Features
+Features: Message queue, retry logic, health monitoring, persistence, thread safety
 """
 
 import discord
@@ -18,6 +18,8 @@ from collections import defaultdict, deque
 from discord.ext import commands
 from aiohttp import web
 import logging
+from typing import Dict, Any, Optional
+import pickle
 
 # Configure logging
 logging.basicConfig(
@@ -26,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-print("🔥 SIMPLIFIED BIDIRECTIONAL BRIDGE WITH DISCORD NICKNAMES & MENTION CONVERSION STARTING!")
+print("🔥 ENHANCED BIDIRECTIONAL BRIDGE WITH RELIABILITY FEATURES STARTING!")
 
 # Environment Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -47,22 +49,92 @@ intents.reactions = True
 intents.guilds = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Simplified Global State
+# Enhanced Global State with Thread Safety
 bot_status = {"ready": False, "start_time": time.time()}
 message_mapping = {}  # Discord message ID -> GroupMe message ID
 reply_context_cache = {}  # Store messages for reply detection
 recent_discord_messages = deque(maxlen=20)  # Store Discord messages with nicknames
 recent_groupme_messages = deque(maxlen=20)  # Store GroupMe messages
 
-# SIMPLIFIED deduplication - much less aggressive
-processed_message_ids = deque(maxlen=100)  # Just track recent message IDs
-last_message_time = {}  # Simple rate limiting per user
+# Thread-safe locks
+mapping_lock = threading.Lock()
+cache_lock = threading.Lock()
+discord_messages_lock = threading.Lock()
+groupme_messages_lock = threading.Lock()
 
-# Simplified duplicate detection
-def is_simple_duplicate(data):
-    """Simplified duplicate detection - only blocks obvious duplicates"""
+# Message Queue System
+message_queue = asyncio.Queue(maxsize=1000)
+failed_messages = deque(maxlen=100)
+failed_messages_lock = threading.Lock()
+
+# Rate limiting with more lenient settings
+processed_message_ids = deque(maxlen=100)
+last_message_time = {}
+RATE_LIMIT_SECONDS = 0.5  # Increased from 0.1 to 0.5 seconds
+
+# Persistence file
+FAILED_MESSAGES_FILE = "failed_messages.json"
+
+# Health monitoring stats
+health_stats = {
+    "messages_sent": 0,
+    "messages_failed": 0,
+    "last_success": time.time(),
+    "last_failure": None,
+    "queue_size": 0
+}
+health_stats_lock = threading.Lock()
+
+# Message retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 2  # Exponential backoff base
+
+async def wait_for_bot_ready(timeout=30):
+    """Wait for bot to be ready with timeout"""
+    start_time = time.time()
+    while not bot.is_ready() and time.time() - start_time < timeout:
+        await asyncio.sleep(0.5)
+    return bot.is_ready()
+
+def update_health_stats(success: bool):
+    """Update health monitoring statistics"""
+    with health_stats_lock:
+        if success:
+            health_stats["messages_sent"] += 1
+            health_stats["last_success"] = time.time()
+        else:
+            health_stats["messages_failed"] += 1
+            health_stats["last_failure"] = time.time()
+
+def save_failed_messages():
+    """Persist failed messages to disk"""
     try:
-        # Only check GroupMe message ID for exact duplicates
+        with failed_messages_lock:
+            if failed_messages:
+                with open(FAILED_MESSAGES_FILE, 'w') as f:
+                    # Convert deque to list for JSON serialization
+                    messages = list(failed_messages)
+                    json.dump(messages, f)
+                logger.info(f"💾 Saved {len(messages)} failed messages to disk")
+    except Exception as e:
+        logger.error(f"❌ Error saving failed messages: {e}")
+
+def load_failed_messages():
+    """Load and retry previously failed messages"""
+    try:
+        if os.path.exists(FAILED_MESSAGES_FILE):
+            with open(FAILED_MESSAGES_FILE, 'r') as f:
+                messages = json.load(f)
+                logger.info(f"📥 Loaded {len(messages)} failed messages from disk")
+                return messages
+    except Exception as e:
+        logger.error(f"❌ Error loading failed messages: {e}")
+    return []
+
+# Enhanced duplicate detection with adjustable rate limiting
+def is_simple_duplicate(data):
+    """Enhanced duplicate detection with configurable rate limiting"""
+    try:
         msg_id = data.get('id')
         if msg_id and msg_id in processed_message_ids:
             logger.info(f"🚫 Exact duplicate message ID: {msg_id}")
@@ -71,14 +143,14 @@ def is_simple_duplicate(data):
         if msg_id:
             processed_message_ids.append(msg_id)
         
-        # Very basic rate limiting - only 0.1 seconds (much more lenient)
+        # Configurable rate limiting
         user_id = data.get('user_id', '')
         current_time = time.time()
         
         if user_id in last_message_time:
             time_diff = current_time - last_message_time[user_id]
-            if time_diff < 0.1:  # Reduced from 0.5 to 0.1 seconds
-                logger.info(f"🚫 Very fast message from {data.get('name', 'Unknown')}")
+            if time_diff < RATE_LIMIT_SECONDS:
+                logger.info(f"🚫 Rate limited message from {data.get('name', 'Unknown')} (waited {time_diff:.2f}s)")
                 return True
         
         last_message_time[user_id] = current_time
@@ -89,39 +161,57 @@ def is_simple_duplicate(data):
         return False
 
 def is_bot_message(data):
-    """Simplified bot detection"""
+    """Check if message is from a bot"""
     if data.get('sender_type') == 'bot':
         return True
     if data.get('sender_id') == GROUPME_BOT_ID:
         return True
-    # Simplified bot name detection
     name = data.get('name', '').lower()
     if name in ['bot', 'groupme', 'system']:
         return True
     return False
 
-# Helper Functions
-async def make_http_request(url, method='GET', data=None, headers=None):
-    """HTTP request helper"""
-    async with aiohttp.ClientSession() as session:
-        try:
-            if method.upper() == 'POST':
-                async with session.post(url, json=data, headers=headers) as response:
-                    return {
-                        'status': response.status,
-                        'data': await response.json() if response.status == 200 else None,
-                        'text': await response.text()
-                    }
-            else:
-                async with session.get(url, headers=headers) as response:
-                    return {
-                        'status': response.status,
-                        'data': await response.json() if response.status == 200 else None,
-                        'text': await response.text()
-                    }
-        except Exception as e:
-            logger.error(f"HTTP request failed: {e}")
-            return {'status': 500, 'data': None, 'text': str(e)}
+# Enhanced HTTP request with retry logic
+async def make_http_request(url, method='GET', data=None, headers=None, retries=3):
+    """HTTP request helper with retry logic"""
+    for attempt in range(retries):
+        async with aiohttp.ClientSession() as session:
+            try:
+                if method.upper() == 'POST':
+                    async with session.post(url, json=data, headers=headers) as response:
+                        result = {
+                            'status': response.status,
+                            'data': await response.json() if response.status in [200, 202] else None,
+                            'text': await response.text()
+                        }
+                        if response.status in [200, 202]:
+                            return result
+                else:
+                    async with session.get(url, headers=headers) as response:
+                        result = {
+                            'status': response.status,
+                            'data': await response.json() if response.status == 200 else None,
+                            'text': await response.text()
+                        }
+                        if response.status == 200:
+                            return result
+                
+                # If we get here, request failed
+                if attempt < retries - 1:
+                    wait_time = RETRY_DELAY_BASE ** attempt
+                    logger.warning(f"⏳ HTTP {response.status}, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    return result
+                    
+            except Exception as e:
+                if attempt < retries - 1:
+                    wait_time = RETRY_DELAY_BASE ** attempt
+                    logger.warning(f"⏳ HTTP request error: {e}, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"❌ HTTP request failed after {retries} attempts: {e}")
+                    return {'status': 500, 'data': None, 'text': str(e)}
 
 async def get_groupme_messages(group_id, limit=20):
     """Get recent GroupMe messages"""
@@ -134,7 +224,7 @@ async def get_groupme_messages(group_id, limit=20):
         return response['data'].get('response', {}).get('messages', [])
     return []
 
-# Enhanced reply detection with better nickname matching
+# Enhanced reply detection
 async def detect_reply_context(data):
     """Enhanced reply detection with better Discord nickname matching"""
     reply_context = None
@@ -147,14 +237,16 @@ async def detect_reply_context(data):
         )
         if reply_attachment:
             reply_id = reply_attachment.get('reply_id') or reply_attachment.get('base_reply_id')
-            if reply_id and reply_id in reply_context_cache:
-                original_msg = reply_context_cache[reply_id]
-                reply_context = {
-                    'text': original_msg.get('text', '[No text]'),
-                    'name': original_msg.get('name', 'Unknown'),
-                    'type': 'official_reply'
-                }
-                logger.info(f"✅ Found official reply to {reply_context['name']}")
+            if reply_id:
+                with cache_lock:
+                    if reply_id in reply_context_cache:
+                        original_msg = reply_context_cache[reply_id]
+                        reply_context = {
+                            'text': original_msg.get('text', '[No text]'),
+                            'name': original_msg.get('name', 'Unknown'),
+                            'type': 'official_reply'
+                        }
+                        logger.info(f"✅ Found official reply to {reply_context['name']}")
     
     # Method 2: Enhanced @mention detection with nickname support
     if not reply_context and data.get('text'):
@@ -164,96 +256,60 @@ async def detect_reply_context(data):
             mentioned_name = mention_match.group(1).lower()
             
             # Check recent Discord messages with enhanced matching
-            for discord_msg in reversed(recent_discord_messages):
-                # Check against display name (nickname) first, then username
-                display_name = discord_msg['author'].lower()
-                username = discord_msg.get('username', '').lower()
-                
-                if (mentioned_name in display_name or 
-                    mentioned_name in username or
-                    mentioned_name == display_name or
-                    mentioned_name == username):
+            with discord_messages_lock:
+                for discord_msg in reversed(recent_discord_messages):
+                    display_name = discord_msg['author'].lower()
+                    username = discord_msg.get('username', '').lower()
                     
-                    reply_context = {
-                        'text': discord_msg['content'],
-                        'name': discord_msg['author'],  # This is the display_name (nickname)
-                        'type': 'mention_reply'
-                    }
-                    logger.info(f"✅ Found @mention reply to {reply_context['name']} (Discord nickname)")
-                    break
-    
-    # Method 3: Enhanced contextual reply detection
-    if not reply_context and data.get('text'):
-        text = data['text'].lower()
-        
-        # Look for common reply patterns mentioning Discord users
-        for discord_msg in reversed(list(recent_discord_messages)[-5:]):  # Check last 5 messages
-            display_name = discord_msg['author'].lower()
-            username = discord_msg.get('username', '').lower()
-            
-            # Check if the GroupMe message seems to be responding to this Discord user
-            if (display_name in text or username in text or
-                any(word in text for word in [display_name.split()[0], username.split()[0]] if word)):
-                
-                reply_context = {
-                    'text': discord_msg['content'],
-                    'name': discord_msg['author'],  # Display name (nickname)
-                    'type': 'contextual_reply'
-                }
-                logger.info(f"✅ Found contextual reply to {reply_context['name']} (Discord nickname)")
-                break
+                    if (mentioned_name in display_name or 
+                        mentioned_name in username or
+                        mentioned_name == display_name or
+                        mentioned_name == username):
+                        
+                        reply_context = {
+                            'text': discord_msg['content'],
+                            'name': discord_msg['author'],
+                            'type': 'mention_reply'
+                        }
+                        logger.info(f"✅ Found @mention reply to {reply_context['name']} (Discord nickname)")
+                        break
     
     return reply_context
 
-# Discord mention conversion function
+# Discord mention conversion
 async def convert_discord_mentions_to_nicknames(text):
-    """Convert Discord mentions (<@123456>) to readable nicknames (@Nick Nanosky)"""
+    """Convert Discord mentions to readable nicknames"""
     if not text or not bot.is_ready():
         return text
     
     try:
-        # Pattern to match Discord mentions: <@123456> or <@!123456>
         mention_pattern = r'<@!?(\d+)>'
         mentions = re.findall(mention_pattern, text)
         
         if not mentions:
             return text
         
-        # Track replacements for logging
-        replacements_made = []
-        
         for user_id in mentions:
             try:
-                # Get the Discord user object
                 user = bot.get_user(int(user_id))
                 if not user:
-                    # Try fetching if not in cache
                     user = await bot.fetch_user(int(user_id))
                 
                 if user:
-                    # Use display name (nickname) if available, otherwise username
                     display_name = getattr(user, 'display_name', user.name)
                     
-                    # Replace the mention with a readable format
                     original_mention = f'<@{user_id}>'
                     nickname_mention = f'<@!{user_id}>'
                     readable_mention = f'@{display_name}'
                     
-                    # Replace both possible mention formats
                     text = text.replace(original_mention, readable_mention)
                     text = text.replace(nickname_mention, readable_mention)
                     
-                    replacements_made.append(f"{original_mention} → @{display_name}")
                     logger.info(f"🏷️  Converted mention: {user_id} → @{display_name}")
-                else:
-                    logger.warning(f"⚠️  Could not find Discord user with ID: {user_id}")
                     
             except Exception as e:
                 logger.error(f"❌ Error converting mention for user ID {user_id}: {e}")
                 continue
-        
-        if replacements_made:
-            logger.info(f"✅ Converted {len(replacements_made)} Discord mentions to nicknames")
         
         return text
         
@@ -261,47 +317,44 @@ async def convert_discord_mentions_to_nicknames(text):
         logger.error(f"❌ Error in mention conversion: {e}")
         return text
 
-# ENHANCED send_to_groupme function - Convert Discord mentions AND use nicknames
+# Message sending functions with queue integration
 async def send_to_groupme(text, author_name=None, reply_context=None):
-    """Enhanced GroupMe send function - converts Discord mentions and ensures ONLY Discord nicknames are shown"""
+    """Send message to GroupMe with retry logic"""
     try:
-        # STEP 1: Convert Discord mentions to readable nicknames
+        # Convert Discord mentions
         text = await convert_discord_mentions_to_nicknames(text)
         
-        # STEP 2: Enhanced reply context formatting - ensure we ONLY show Discord nicknames
+        # Format reply context
         if reply_context:
             quoted_text = reply_context.get('text', 'previous message')
-            reply_author = reply_context.get('name', 'Someone')  # This MUST be display_name only
+            reply_author = reply_context.get('name', 'Someone')
             preview = quoted_text[:100] + '...' if len(quoted_text) > 100 else quoted_text
-            
-            # Also convert mentions in the quoted text
             preview = await convert_discord_mentions_to_nicknames(preview)
-            
-            # Clean formatting for GroupMe - just show the Discord nickname
             text = f"↪️ **{author_name} replying to {reply_author}:**\n> {preview}\n\n{text}"
-            logger.info(f"✅ Formatted GroupMe reply showing Discord nickname: {reply_author}")
         else:
-            # Add author name if not already present - use ONLY the display_name (nickname)
             if author_name and not text.startswith(author_name):
                 text = f"{author_name}: {text}" if text.strip() else f"{author_name} sent content"
         
         payload = {"bot_id": GROUPME_BOT_ID, "text": text}
         response = await make_http_request(GROUPME_POST_URL, 'POST', payload)
         
-        if response['status'] == 202:
-            logger.info(f"✅ Message sent to GroupMe using nickname '{author_name}': {text[:50]}...")
-            return True
+        success = response['status'] == 202
+        update_health_stats(success)
+        
+        if success:
+            logger.info(f"✅ Message sent to GroupMe: {text[:50]}...")
         else:
             logger.error(f"❌ Failed to send to GroupMe: {response['status']}")
-            return False
+            
+        return success
             
     except Exception as e:
         logger.error(f"❌ Error sending to GroupMe: {e}")
+        update_health_stats(False)
         return False
 
-# Enhanced send_to_discord function with better reply formatting
 async def send_to_discord(message, reply_context=None):
-    """Enhanced Discord send function with nickname-aware reply formatting"""
+    """Send message to Discord with retry logic"""
     try:
         discord_channel = bot.get_channel(DISCORD_CHANNEL_ID)
         if not discord_channel:
@@ -311,17 +364,12 @@ async def send_to_discord(message, reply_context=None):
         content = message.get('text', '[No text content]')
         author = message.get('name', 'GroupMe User')
         
-        # Enhanced reply context formatting - ONLY show Discord nicknames, never usernames
+        # Format reply context
         if reply_context:
             original_text = reply_context.get('text', '[No text]')
-            original_author = reply_context.get('name', 'Unknown')  # This should be display_name only
+            original_author = reply_context.get('name', 'Unknown')
             preview = original_text[:200] + '...' if len(original_text) > 200 else original_text
-            
-            # Clean formatting - just show the nickname without extra labels
-            reply_type = reply_context.get('type', 'reply')
             content = f"↪️ **{author}** replying to **{original_author}**:\n> {preview}\n\n{content}"
-            
-            logger.info(f"✅ Formatted reply to Discord user nickname: {original_author}")
         
         # Handle images
         embeds = []
@@ -334,91 +382,148 @@ async def send_to_discord(message, reply_context=None):
         formatted_content = f"**{author}:** {content}" if content else f"**{author}** sent an attachment"
         sent_message = await discord_channel.send(formatted_content, embeds=embeds)
         
-        # Enhanced mapping storage with Discord user tracking - store ONLY display_name
+        # Store mapping with thread safety
         if message.get('id'):
-            message_mapping[sent_message.id] = message['id']
-            # Store with enhanced metadata for better reply tracking
-            reply_context_cache[message['id']] = {
-                **message,
-                'discord_message_id': sent_message.id,
-                'processed_timestamp': time.time()
-            }
+            with mapping_lock:
+                message_mapping[sent_message.id] = message['id']
+            with cache_lock:
+                reply_context_cache[message['id']] = {
+                    **message,
+                    'discord_message_id': sent_message.id,
+                    'processed_timestamp': time.time()
+                }
         
+        update_health_stats(True)
         logger.info(f"✅ Message sent to Discord: {content[:50]}...")
         return True
         
     except Exception as e:
         logger.error(f"❌ Failed to send to Discord: {e}")
+        update_health_stats(False)
         return False
 
-# Simplified webhook server
+# Message queue processor
+async def message_queue_processor():
+    """Process messages from the queue with retry logic"""
+    logger.info("📬 Starting message queue processor...")
+    
+    while True:
+        try:
+            # Update queue size for health monitoring
+            with health_stats_lock:
+                health_stats["queue_size"] = message_queue.qsize()
+            
+            # Get message from queue
+            msg_data = await message_queue.get()
+            
+            # Extract message details
+            send_func = msg_data['send_func']
+            kwargs = msg_data['kwargs']
+            retries = msg_data.get('retries', 0)
+            msg_type = msg_data.get('type', 'unknown')
+            
+            logger.info(f"📤 Processing {msg_type} message (attempt {retries + 1}/{MAX_RETRIES})")
+            
+            # Try to send the message
+            success = await send_func(**kwargs)
+            
+            if not success and retries < MAX_RETRIES - 1:
+                # Retry with exponential backoff
+                msg_data['retries'] = retries + 1
+                wait_time = RETRY_DELAY_BASE ** (retries + 1)
+                logger.warning(f"⏳ Message failed, retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                await message_queue.put(msg_data)
+            elif not success:
+                # Max retries reached, add to failed messages
+                with failed_messages_lock:
+                    failed_messages.append(msg_data)
+                logger.error(f"❌ Message failed after {MAX_RETRIES} attempts")
+                save_failed_messages()
+            else:
+                logger.info(f"✅ Message sent successfully")
+                
+        except Exception as e:
+            logger.error(f"❌ Queue processor error: {e}")
+            await asyncio.sleep(1)
+
+# Enhanced webhook server
 async def run_webhook_server():
-    """Simplified webhook server"""
+    """Enhanced webhook server with queue integration"""
     
     async def health_check(request):
+        with health_stats_lock:
+            stats = health_stats.copy()
+        
         return web.json_response({
             "status": "healthy",
             "bot_ready": bot_status["ready"],
             "uptime": time.time() - bot_status["start_time"],
             "features": {
-                "simplified_processing": True,
-                "minimal_duplicate_prevention": True,
-                "bidirectional_replies": True,
+                "message_queue": True,
+                "retry_logic": True,
+                "health_monitoring": True,
+                "persistence": True,
+                "thread_safety": True,
                 "discord_nicknames_only": True,
                 "discord_mention_conversion": True
             },
+            "health_stats": stats,
             "processed_messages": len(processed_message_ids),
-            "reply_cache_size": len(reply_context_cache)
+            "reply_cache_size": len(reply_context_cache),
+            "failed_messages": len(failed_messages)
         })
     
     async def groupme_webhook(request):
-        """Simplified webhook handler"""
+        """Enhanced webhook handler with queue integration"""
         try:
             data = await request.json()
             sender_info = f"{data.get('name', 'Unknown')} ({data.get('sender_type', 'unknown')})"
             logger.info(f"📨 GroupMe webhook: {sender_info} - {data.get('text', '')[:50]}...")
             
-            # Simple bot message filter
+            # Bot message filter
             if is_bot_message(data):
                 logger.info(f"🤖 Ignoring bot message from {data.get('name', 'Unknown')}")
                 return web.json_response({"status": "ignored", "reason": "bot_message"})
             
-            # Simplified duplicate check
+            # Duplicate check
             if is_simple_duplicate(data):
                 return web.json_response({"status": "ignored", "reason": "duplicate"})
             
             logger.info(f"✅ Processing message from {data.get('name', 'Unknown')}")
             
-            # Store in recent messages for context (simplified)
+            # Store in recent messages
             if data.get('id'):
-                recent_groupme_messages.append({
-                    'id': data['id'],
-                    'text': data.get('text', ''),
-                    'name': data.get('name', ''),
-                    'created_at': data.get('created_at', time.time())
-                })
-                reply_context_cache[data['id']] = data
+                with groupme_messages_lock:
+                    recent_groupme_messages.append({
+                        'id': data['id'],
+                        'text': data.get('text', ''),
+                        'name': data.get('name', ''),
+                        'created_at': data.get('created_at', time.time())
+                    })
+                with cache_lock:
+                    reply_context_cache[data['id']] = data
             
-            # Handle reactions (simplified)
-            if data.get('favorited_by') and len(data['favorited_by']) > 0:
-                if bot.is_ready():
-                    asyncio.run_coroutine_threadsafe(
-                        send_reaction_to_discord(data),
-                        bot.loop
-                    )
-                    logger.info("⚡ Reaction sent to Discord")
-            else:
-                # Handle regular messages
-                reply_context = await detect_reply_context(data)
-                
-                if bot.is_ready():
-                    asyncio.run_coroutine_threadsafe(
-                        send_to_discord(data, reply_context),
-                        bot.loop
-                    )
-                    logger.info("⚡ Message sent to Discord")
+            # Check if bot is ready
+            if not bot.is_ready():
+                logger.warning("⏳ Bot not ready, queuing message...")
+                # Wait a bit for bot to be ready
+                ready = await wait_for_bot_ready(timeout=5)
+                if not ready:
+                    logger.error("❌ Bot still not ready after timeout")
             
-            return web.json_response({"status": "success"})
+            # Detect reply context
+            reply_context = await detect_reply_context(data)
+            
+            # Queue the message for Discord
+            await message_queue.put({
+                'send_func': send_to_discord,
+                'kwargs': {'message': data, 'reply_context': reply_context},
+                'type': 'groupme_to_discord',
+                'retries': 0
+            })
+            
+            return web.json_response({"status": "queued"})
             
         except Exception as e:
             logger.error(f"❌ Error handling GroupMe webhook: {e}")
@@ -436,33 +541,13 @@ async def run_webhook_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    logger.info(f"🌐 Simplified webhook server running on 0.0.0.0:{PORT}")
+    logger.info(f"🌐 Enhanced webhook server running on 0.0.0.0:{PORT}")
     
     try:
         while True:
             await asyncio.sleep(3600)
     except asyncio.CancelledError:
         await runner.cleanup()
-
-async def send_reaction_to_discord(data):
-    """Send reaction to Discord"""
-    try:
-        discord_channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        if not discord_channel:
-            return False
-        
-        latest_reaction = data['favorited_by'][-1]
-        emoji = latest_reaction.get('emoji', '❤️')
-        reacter_name = latest_reaction.get('nickname', 'Someone')
-        message_preview = data.get('text', '[No text]')[:100]
-        
-        content = f"{emoji} **{reacter_name}** reacted to: \"{message_preview}\""
-        await discord_channel.send(content)
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to send reaction to Discord: {e}")
-        return False
 
 def start_webhook_server():
     """Start webhook server in thread"""
@@ -489,17 +574,30 @@ async def on_ready():
     
     logger.info(f'🤖 {bot.user} connected to Discord!')
     logger.info(f'📺 Channel ID: {DISCORD_CHANNEL_ID}')
-    logger.info(f'🔒 Simplified processing: ✅')
-    logger.info(f'⚡ Minimal duplicate prevention: ✅')
-    logger.info(f'🔄 Bidirectional replies: ✅')
-    logger.info(f'🏷️  Discord nicknames only: ✅')
-    logger.info(f'🔗 Discord mention conversion: ✅')
+    logger.info(f'📬 Message queue: ✅')
+    logger.info(f'🔄 Retry logic: ✅')
+    logger.info(f'💾 Persistence: ✅')
+    logger.info(f'🔒 Thread safety: ✅')
+    logger.info(f'📊 Health monitoring: ✅')
+    
+    # Start the message queue processor
+    asyncio.create_task(message_queue_processor())
+    
+    # Load and retry any failed messages
+    failed = load_failed_messages()
+    if failed:
+        for msg in failed:
+            await message_queue.put(msg)
+        # Clear the file after loading
+        try:
+            os.remove(FAILED_MESSAGES_FILE)
+        except:
+            pass
 
-# ENHANCED Discord message handler - Convert mentions AND use nicknames for GroupMe
 @bot.event
 async def on_message(message):
-    """ENHANCED message handler - converts Discord mentions and ensures ONLY Discord nicknames appear on GroupMe"""
-    # Basic filters only
+    """Enhanced message handler with queue integration"""
+    # Basic filters
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         await bot.process_commands(message)
         return
@@ -509,39 +607,36 @@ async def on_message(message):
         await bot.process_commands(message)
         return
     
-    # Get the Discord display name (nickname) - this is what will appear on GroupMe
+    # Get Discord display name
     discord_nickname = message.author.display_name
     discord_username = message.author.name
     
     logger.info(f"📨 Processing Discord message from '{discord_nickname}' (username: {discord_username})")
-    logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
     
-    # Check for Discord mentions that will be converted
-    if '<@' in message.content:
-        logger.info(f"🔗 Message contains Discord mentions - will be converted to nicknames")
-    
-    # Enhanced Discord message tracking - store ONLY the display_name for GroupMe use
+    # Store in recent messages with thread safety
     discord_msg_data = {
         'content': message.content,
-        'author': discord_nickname,  # PRIMARY: Display name (nickname) for GroupMe
-        'username': discord_username,        # INTERNAL: Username for matching only
-        'author_id': message.author.id,         # For precise matching
+        'author': discord_nickname,
+        'username': discord_username,
+        'author_id': message.author.id,
         'timestamp': time.time(),
         'message_id': message.id
     }
-    recent_discord_messages.append(discord_msg_data)
     
-    # Simple reply detection - ensure we use display_name in reply context
+    with discord_messages_lock:
+        recent_discord_messages.append(discord_msg_data)
+    
+    # Detect reply context
     reply_context = None
     if message.reference and message.reference.message_id:
         try:
             replied_message = await message.channel.fetch_message(message.reference.message_id)
             reply_context = {
                 'text': replied_message.content[:200],
-                'name': replied_message.author.display_name,  # ONLY display_name (nickname)
+                'name': replied_message.author.display_name,
                 'type': 'official_reply'
             }
-            logger.info(f"✅ Found Discord reply to nickname: '{reply_context['name']}'")
+            logger.info(f"✅ Found Discord reply to: '{reply_context['name']}'")
         except:
             pass
     
@@ -563,124 +658,201 @@ async def on_message(message):
             else:
                 message_content = ' '.join(attachment_info)
     
-    # Send to GroupMe using ONLY the display_name (nickname) - mentions will be converted automatically
+    # Queue message for GroupMe
     if message_content.strip():
-        await send_to_groupme(message_content, discord_nickname, reply_context)
-        logger.info(f"⚡ Message sent to GroupMe showing nickname: '{discord_nickname}'")
-        logger.info(f"   (NOT showing username: '{discord_username}')")
+        await message_queue.put({
+            'send_func': send_to_groupme,
+            'kwargs': {
+                'text': message_content,
+                'author_name': discord_nickname,
+                'reply_context': reply_context
+            },
+            'type': 'discord_to_groupme',
+            'retries': 0
+        })
+        logger.info(f"📬 Queued message for GroupMe from '{discord_nickname}'")
     
     await bot.process_commands(message)
 
-# ENHANCED reaction handling - ALWAYS use Discord nicknames on GroupMe
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Handle reaction additions - ensures ONLY Discord nicknames appear on GroupMe"""
+    """Handle reaction additions with queue integration"""
     if (user.bot or reaction.message.channel.id != DISCORD_CHANNEL_ID):
         return
     
     emoji = str(reaction.emoji)
     discord_nickname = user.display_name
-    discord_username = user.name
     
-    logger.info(f"😀 Processing reaction {emoji} from '{discord_nickname}' (username: {discord_username})")
-    logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
+    logger.info(f"😀 Processing reaction {emoji} from '{discord_nickname}'")
     
-    # Send reaction to GroupMe using ONLY display_name (nickname) - never username
+    # Queue reaction for GroupMe
     original_content = reaction.message.content[:50] if reaction.message.content else "a message"
     reaction_text = f"{discord_nickname} reacted {emoji} to '{original_content}...'"
     
-    await send_to_groupme(reaction_text, discord_nickname)
-    logger.info(f"✅ Reaction sent to GroupMe showing nickname: '{discord_nickname}'")
-    logger.info(f"   (NOT showing username: '{discord_username}')")
+    await message_queue.put({
+        'send_func': send_to_groupme,
+        'kwargs': {
+            'text': reaction_text,
+            'author_name': discord_nickname
+        },
+        'type': 'discord_reaction',
+        'retries': 0
+    })
 
-# Enhanced Bot Commands
+# Health monitoring task
+async def health_monitor():
+    """Monitor bridge health and log statistics"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Every 5 minutes
+            
+            with health_stats_lock:
+                stats = health_stats.copy()
+            
+            total_messages = stats["messages_sent"] + stats["messages_failed"]
+            if total_messages > 0:
+                success_rate = (stats["messages_sent"] / total_messages) * 100
+            else:
+                success_rate = 100
+            
+            logger.info(f"""
+📊 BRIDGE HEALTH REPORT:
+✅ Messages sent: {stats["messages_sent"]}
+❌ Messages failed: {stats["messages_failed"]}
+📈 Success rate: {success_rate:.1f}%
+📬 Queue size: {stats["queue_size"]}
+💾 Failed messages: {len(failed_messages)}
+⏰ Last success: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats["last_success"]))}
+            """)
+            
+            # Alert if failure rate is high
+            if success_rate < 90 and total_messages > 10:
+                logger.warning(f"⚠️  High failure rate detected: {100-success_rate:.1f}%")
+            
+            # Save failed messages periodically
+            save_failed_messages()
+            
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+
+# Enhanced cleanup task
+async def enhanced_cleanup():
+    """Enhanced cleanup with persistence"""
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Every hour
+            
+            # Clean old mappings with thread safety
+            with mapping_lock:
+                if len(message_mapping) > 500:
+                    old_keys = list(message_mapping.keys())[:-500]
+                    for key in old_keys:
+                        message_mapping.pop(key, None)
+            
+            # Clean old reply cache
+            with cache_lock:
+                if len(reply_context_cache) > 200:
+                    old_keys = list(reply_context_cache.keys())[:-200]
+                    for key in old_keys:
+                        reply_context_cache.pop(key, None)
+            
+            # Save any pending failed messages
+            save_failed_messages()
+            
+            logger.info("🧹 Cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+# Bot Commands
 @bot.command(name='status')
 async def status(ctx):
-    """Enhanced status command"""
+    """Enhanced status command with health stats"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
+    
+    with health_stats_lock:
+        stats = health_stats.copy()
+    
+    total_messages = stats["messages_sent"] + stats["messages_failed"]
+    success_rate = (stats["messages_sent"] / total_messages * 100) if total_messages > 0 else 100
     
     status_msg = f"""🟢 **Enhanced Bridge Status**
 🔗 GroupMe Bot: {'✅' if GROUPME_BOT_ID else '❌'}
 🔑 Access Token: {'✅' if GROUPME_ACCESS_TOKEN else '❌'}
 🌐 Webhook Server: ✅
-⚡ **Minimal Filtering: ✅**
-🔄 **Bidirectional Replies: ✅**
-🏷️  **Discord Nicknames Only: ✅**
-🔗 **Discord Mention Conversion: ✅**
 
-📝 Recent Message IDs: {len(processed_message_ids)}
+**📊 Health Statistics:**
+✅ Messages sent: {stats["messages_sent"]}
+❌ Messages failed: {stats["messages_failed"]}
+📈 Success rate: {success_rate:.1f}%
+📬 Queue size: {stats["queue_size"]}
+💾 Failed messages: {len(failed_messages)}
+
+**🔧 Enhanced Features:**
+📬 Message Queue: ✅
+🔄 Retry Logic: ✅ (max {MAX_RETRIES} attempts)
+💾 Persistence: ✅
+🔒 Thread Safety: ✅
+📊 Health Monitoring: ✅
+🏷️ Discord Nicknames: ✅
+🔗 Mention Conversion: ✅
+
+📝 Recent Messages: {len(processed_message_ids)}
 💬 Message Mappings: {len(message_mapping)}
-🔗 Reply Cache: {len(reply_context_cache)}
-
-**Enhanced - Discord mentions (@user) converted to nicknames on GroupMe!**
-*Example: `<@567521619334135828>` → `@Danoush Paborji`*"""
+🔗 Reply Cache: {len(reply_context_cache)}"""
     
     await ctx.send(status_msg)
 
-@bot.command(name='test')
-async def test_send(ctx, *, message="Test message from Discord"):
-    """Test sending a message to GroupMe - uses Discord nickname"""
+@bot.command(name='retry')
+async def retry_failed(ctx):
+    """Retry all failed messages"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send("❌ This command only works in the bridged channel")
         return
     
-    discord_nickname = ctx.author.display_name
-    discord_username = ctx.author.name
+    with failed_messages_lock:
+        count = len(failed_messages)
+        if count == 0:
+            await ctx.send("✅ No failed messages to retry")
+            return
+        
+        # Queue all failed messages for retry
+        for msg in list(failed_messages):
+            msg['retries'] = 0  # Reset retry count
+            await message_queue.put(msg)
+        
+        failed_messages.clear()
     
-    logger.info(f"🧪 Test command from '{discord_nickname}' (username: {discord_username})")
-    logger.info(f"🏷️  Will appear on GroupMe as: '{discord_nickname}'")
-    
-    success = await send_to_groupme(message, discord_nickname)
-    if success:
-        await ctx.send(f"✅ Test message sent to GroupMe as '{discord_nickname}'!")
-    else:
-        await ctx.send("❌ Failed to send test message to GroupMe")
+    await ctx.send(f"🔄 Queued {count} failed messages for retry")
 
-@bot.command(name='testmention')
-async def test_mention(ctx):
-    """Test Discord mention conversion"""
+@bot.command(name='health')
+async def health_report(ctx):
+    """Detailed health report"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
-        await ctx.send("❌ This command only works in the bridged channel")
         return
     
-    discord_nickname = ctx.author.display_name
-    test_message = f"Hey {ctx.author.mention}, this mention will be converted to your nickname on GroupMe!"
+    with health_stats_lock:
+        stats = health_stats.copy()
     
-    logger.info(f"🧪 Testing mention conversion for '{discord_nickname}'")
-    logger.info(f"🔗 Original: {test_message}")
+    embed = discord.Embed(
+        title="🏥 Bridge Health Report",
+        color=discord.Color.green() if stats["messages_failed"] < stats["messages_sent"] * 0.1 else discord.Color.orange()
+    )
     
-    converted_message = await convert_discord_mentions_to_nicknames(test_message)
-    logger.info(f"🔗 Converted: {converted_message}")
+    total = stats["messages_sent"] + stats["messages_failed"]
+    success_rate = (stats["messages_sent"] / total * 100) if total > 0 else 100
     
-    success = await send_to_groupme(test_message, "Bot Test", None)
-    if success:
-        await ctx.send(f"✅ Mention test sent! Your Discord mention was converted to '@{discord_nickname}' on GroupMe.")
-    else:
-        await ctx.send("❌ Failed to send mention test to GroupMe")
-
-# Simple cleanup task
-async def simple_cleanup():
-    """Simple cleanup task"""
-    while True:
-        try:
-            # Clean old mappings (keep it simple)
-            if len(message_mapping) > 500:
-                old_keys = list(message_mapping.keys())[:-500]
-                for key in old_keys:
-                    message_mapping.pop(key, None)
-            
-            # Clean old reply cache
-            if len(reply_context_cache) > 200:
-                old_keys = list(reply_context_cache.keys())[:-200]
-                for key in old_keys:
-                    reply_context_cache.pop(key, None)
-            
-            await asyncio.sleep(3600)  # Run every hour
-            
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-            await asyncio.sleep(3600)
+    embed.add_field(name="✅ Success Rate", value=f"{success_rate:.1f}%", inline=True)
+    embed.add_field(name="📬 Queue Size", value=stats["queue_size"], inline=True)
+    embed.add_field(name="💾 Failed Messages", value=len(failed_messages), inline=True)
+    
+    if stats["last_failure"]:
+        last_fail = time.strftime('%H:%M:%S', time.localtime(stats["last_failure"]))
+        embed.add_field(name="❌ Last Failure", value=last_fail, inline=True)
+    
+    embed.add_field(name="📊 Total Processed", value=f"{total} messages", inline=False)
+    
+    await ctx.send(embed=embed)
 
 # Main Function
 def main():
@@ -698,23 +870,32 @@ def main():
         return
     
     logger.info("🚀 Starting ENHANCED GroupMe-Discord Bridge...")
-    logger.info("⚡ Minimal duplicate prevention!")
-    logger.info("🔄 Simple bidirectional replies!")
-    logger.info("🏷️  Discord nicknames only on GroupMe!")
-    logger.info("🔗 Discord mention conversion enabled!")
+    logger.info("📬 Message queue enabled!")
+    logger.info("🔄 Retry logic enabled!")
+    logger.info("💾 Persistence enabled!")
+    logger.info("🔒 Thread safety enabled!")
+    logger.info("📊 Health monitoring enabled!")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
     time.sleep(2)
     
-    # Start cleanup task and run bot
+    # Start bot with tasks
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.create_task(simple_cleanup())
+        
+        # Create tasks
+        loop.create_task(enhanced_cleanup())
+        loop.create_task(health_monitor())
+        
+        # Run bot
         bot.run(DISCORD_BOT_TOKEN)
     except Exception as e:
         logger.error(f"❌ Bot failed to start: {e}")
+    finally:
+        # Save any failed messages before exit
+        save_failed_messages()
 
 if __name__ == "__main__":
     main()
