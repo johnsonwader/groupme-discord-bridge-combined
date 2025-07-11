@@ -62,9 +62,10 @@ cache_lock = threading.Lock()
 discord_messages_lock = threading.Lock()
 groupme_messages_lock = threading.Lock()
 
-# Enhanced message tracking with timestamps
+# Enhanced message tracking with timestamps and image tracking
 processed_discord_ids = {}  # Now stores {message_id: timestamp}
 processed_groupme_ids = {}  # Now stores {message_id: timestamp}
+processed_discord_images = {}  # Track image uploads: {message_id: [image_urls]}
 tracking_lock = threading.Lock()
 
 # Currently processing messages (race condition prevention)
@@ -302,14 +303,23 @@ async def upload_image_to_groupme(image_url):
             logger.error("❌ GROUPME_ACCESS_TOKEN not configured for image upload")
             return None
         
+        logger.info(f"📥 Downloading image from Discord: {image_url[:50]}...")
+        
         # Download image from Discord
         async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
+            async with session.get(image_url, timeout=30) as resp:
                 if resp.status != 200:
                     logger.error(f"Failed to download image from Discord: {resp.status}")
                     return None
                 image_data = await resp.read()
                 content_type = resp.headers.get('Content-Type', 'image/png')
+                image_size = len(image_data)
+                logger.info(f"📥 Downloaded {image_size} bytes, type: {content_type}")
+        
+        # Check image size (GroupMe has limits)
+        if image_size > 10 * 1024 * 1024:  # 10MB limit
+            logger.error(f"❌ Image too large: {image_size} bytes (limit 10MB)")
+            return None
         
         # Upload to GroupMe
         headers = {
@@ -317,8 +327,10 @@ async def upload_image_to_groupme(image_url):
             'Content-Type': content_type
         }
         
+        logger.info(f"📤 Uploading {image_size} bytes to GroupMe image service...")
+        
         async with aiohttp.ClientSession() as session:
-            async with session.post(GROUPME_IMAGE_UPLOAD_URL, data=image_data, headers=headers) as resp:
+            async with session.post(GROUPME_IMAGE_UPLOAD_URL, data=image_data, headers=headers, timeout=30) as resp:
                 if resp.status == 200:
                     result = await resp.json()
                     image_url = result['payload']['url']
@@ -326,14 +338,17 @@ async def upload_image_to_groupme(image_url):
                     return image_url
                 else:
                     error_text = await resp.text()
-                    logger.error(f"❌ Failed to upload image to GroupMe: {resp.status} - {error_text}")
+                    logger.error(f"❌ Failed to upload image to GroupMe: {resp.status} - {error_text[:200]}")
                     return None
                     
+    except asyncio.TimeoutError:
+        logger.error("❌ Timeout while uploading image to GroupMe")
+        return None
     except Exception as e:
         logger.error(f"❌ Error uploading image to GroupMe: {e}")
         return None
 
-async def send_to_groupme(text, author_name=None, reply_context=None, add_instance_id=False, image_urls=None):
+async def send_to_groupme(text, author_name=None, reply_context=None, add_instance_id=False, image_urls=None, message_id=None):
     """Send message to GroupMe - NO RETRIES except for 500 errors"""
     start_time = time.time()
     
@@ -341,6 +356,17 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
         if not GROUPME_BOT_ID:
             logger.error("❌ GROUPME_BOT_ID not configured")
             return False
+        
+        # Check if we've already processed images for this message
+        if message_id and image_urls:
+            with tracking_lock:
+                if message_id in processed_discord_images:
+                    logger.warning(f"🚫 DUPLICATE IMAGE SEND BLOCKED for message {message_id}")
+                    logger.warning(f"Already sent images: {processed_discord_images[message_id]}")
+                    audit_message('duplicate_image_blocked', message_id, f"Already sent {len(processed_discord_images[message_id])} images")
+                    return False
+                # Mark images as being processed
+                processed_discord_images[message_id] = image_urls.copy()
         
         # Convert Discord mentions
         text = await convert_discord_mentions_to_nicknames(text)
@@ -370,23 +396,27 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
         # Add image attachments if provided
         if image_urls:
             attachments = []
-            for img_url in image_urls:
-                logger.info(f"📸 Uploading image to GroupMe: {img_url}")
+            for i, img_url in enumerate(image_urls):
+                logger.info(f"📸 [{i+1}/{len(image_urls)}] Uploading image for message {message_id}: {img_url[:50]}...")
+                audit_message('image_upload_start', message_id or 'N/A', f"Image {i+1}/{len(image_urls)}")
+                
                 groupme_image_url = await upload_image_to_groupme(img_url)
                 if groupme_image_url:
                     attachments.append({
                         "type": "image",
                         "url": groupme_image_url
                     })
+                    audit_message('image_upload_success', message_id or 'N/A', f"Image {i+1} uploaded")
                 else:
-                    logger.warning(f"⚠️ Failed to upload image, will note in message")
-                    text += " [Image upload failed]"
+                    logger.warning(f"⚠️ Failed to upload image {i+1}, will note in message")
+                    text += f" [Image {i+1} upload failed]"
+                    audit_message('image_upload_failed', message_id or 'N/A', f"Image {i+1} failed")
             
             if attachments:
                 payload["attachments"] = attachments
-                logger.info(f"📎 Added {len(attachments)} image attachment(s) to message")
+                logger.info(f"📎 Added {len(attachments)} image attachment(s) to message {message_id}")
         
-        audit_message('groupme_send_start', 'N/A', f"Sending: {text[:50]}... with {len(image_urls) if image_urls else 0} images")
+        audit_message('groupme_send_start', message_id or 'N/A', f"Sending: {text[:50]}... with {len(image_urls) if image_urls else 0} images")
         
         # Try up to 3 times ONLY for 500 errors
         for attempt in range(3):
@@ -395,7 +425,7 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
             duration = time.time() - start_time
             success = response['status'] == 202
             
-            audit_message('groupme_send_result', 'N/A', 
+            audit_message('groupme_send_result', message_id or 'N/A', 
                          f"Status={response['status']}, Duration={duration:.3f}s, Success={success}, Attempt={attempt+1}")
             
             if success:
@@ -418,6 +448,12 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
                 if response['status'] >= 500:
                     logger.error("🚨 GroupMe server error - this is on their end, not yours!")
                     logger.error(f"Full response: {response}")
+                
+                # Clear image tracking on failure
+                if message_id and image_urls:
+                    with tracking_lock:
+                        processed_discord_images.pop(message_id, None)
+                
                 return False
         
         return False
@@ -425,7 +461,13 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
     except Exception as e:
         duration = time.time() - start_time
         logger.error(f"❌ Error sending to GroupMe after {duration:.3f}s: {e}")
-        audit_message('groupme_send_error', 'N/A', str(e))
+        audit_message('groupme_send_error', message_id or 'N/A', str(e))
+        
+        # Clear image tracking on error
+        if message_id and image_urls:
+            with tracking_lock:
+                processed_discord_images.pop(message_id, None)
+        
         return False
 
 async def send_to_discord(message, reply_context=None):
@@ -770,6 +812,13 @@ async def on_message(message):
                     sorted_ids = sorted(processed_discord_ids.items(), key=lambda x: x[1])
                     for old_id, _ in sorted_ids[:200]:
                         del processed_discord_ids[old_id]
+                
+                # Cleanup old image tracking
+                if len(processed_discord_images) > 500:
+                    # Remove oldest entries
+                    old_image_ids = list(processed_discord_images.keys())[:100]
+                    for old_id in old_image_ids:
+                        del processed_discord_images[old_id]
             
             # Get message info
             discord_nickname = message.author.display_name
@@ -778,6 +827,14 @@ async def on_message(message):
             # Collect image URLs
             image_urls = []
             if message.attachments:
+                # Check for recent duplicate image sends (within 5 seconds)
+                with tracking_lock:
+                    if message_id in processed_discord_images:
+                        last_images = processed_discord_images[message_id]
+                        logger.warning(f"🚫 Message {message_id} already had images processed: {last_images}")
+                        audit_message('discord_duplicate_images', message_id, f"Already processed {len(last_images)} images")
+                        return
+                
                 for attachment in message.attachments:
                     # Check if it's an image
                     if attachment.content_type and attachment.content_type.startswith('image/'):
@@ -832,7 +889,8 @@ async def on_message(message):
                 text=message_content,
                 author_name=discord_nickname,
                 reply_context=reply_context,
-                image_urls=image_urls
+                image_urls=image_urls,
+                message_id=message_id
             )
             
             if success:
@@ -896,6 +954,7 @@ async def status(ctx):
     with tracking_lock:
         discord_tracked = len(processed_discord_ids)
         groupme_tracked = len(processed_groupme_ids)
+        images_tracked = len(processed_discord_images)
     
     with processing_lock:
         currently_proc = len(currently_processing)
@@ -918,6 +977,7 @@ Failed requests: {stats["failed_requests"]}
 **🔍 Tracking:**
 Discord messages: {discord_tracked}
 GroupMe messages: {groupme_tracked}
+Messages with images: {images_tracked}
 Currently processing: {currently_proc}
 
 **⏰ Last Activity:**
@@ -953,6 +1013,13 @@ async def show_audit(ctx, count: int = 10):
         field_value = f"ID: {entry['message_id'][:8]}...\n{entry['details'][:50]}"
         if entry['instance'] != BOT_INSTANCE_ID:
             field_value += f"\n⚠️ Different instance: {entry['instance']}"
+        
+        # Add emoji for image-related events
+        if 'image' in entry['event'].lower():
+            field_name = f"📸 {field_name}"
+        elif 'duplicate' in entry['event'].lower():
+            field_name = f"🚫 {field_name}"
+        
         embed.add_field(name=field_name, value=field_value, inline=False)
     
     await ctx.send(embed=embed)
@@ -983,6 +1050,128 @@ async def debug_discord(ctx):
         )
     
     await ctx.send(embed=embed)
+
+@bot.command(name='debug_images')
+async def debug_images(ctx):
+    """Show recent image uploads"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    with tracking_lock:
+        image_count = len(processed_discord_images)
+        recent_images = list(processed_discord_images.items())[-5:]
+    
+    embed = discord.Embed(
+        title="📸 Recent Image Uploads",
+        description=f"Tracking {image_count} messages with images",
+        color=discord.Color.blue()
+    )
+    
+    if recent_images:
+        for msg_id, img_urls in reversed(recent_images):
+            embed.add_field(
+                name=f"Message {msg_id[:8]}...",
+                value=f"{len(img_urls)} image(s)\n{img_urls[0][:30]}..." if img_urls else "No URLs",
+                inline=False
+            )
+    else:
+        embed.add_field(name="No Recent Images", value="No images have been uploaded yet", inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='image_test')
+async def image_test(ctx):
+    """Test image duplicate detection"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    await ctx.send("🧪 Testing image duplicate detection...")
+    
+    # First, show current image tracking state
+    with tracking_lock:
+        tracked_count = len(processed_discord_images)
+        recent = list(processed_discord_images.items())[-3:] if processed_discord_images else []
+    
+    embed = discord.Embed(
+        title="📸 Image Duplicate Detection Test",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="Current State",
+        value=f"Tracking {tracked_count} messages with images",
+        inline=False
+    )
+    
+    if recent:
+        for msg_id, urls in recent:
+            embed.add_field(
+                name=f"Message {msg_id[:8]}...",
+                value=f"{len(urls)} images",
+                inline=True
+            )
+    
+    # Send a test image to check detection
+    test_msg_id = f"img_test_{ctx.message.id}"
+    test_url = "https://discord.com/assets/2c21aeda16de354ba5334551a883b481.png"
+    
+    embed.add_field(
+        name="Test 1",
+        value="Sending test image...",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+    
+    # First attempt
+    success1 = await send_to_groupme(
+        text="Image duplicate test 1",
+        author_name="IMG_DUP_TEST",
+        image_urls=[test_url],
+        message_id=test_msg_id
+    )
+    
+    await asyncio.sleep(1)
+    
+    # Second attempt (should be blocked)
+    success2 = await send_to_groupme(
+        text="Image duplicate test 2",
+        author_name="IMG_DUP_TEST",
+        image_urls=[test_url],
+        message_id=test_msg_id
+    )
+    
+    result_embed = discord.Embed(
+        title="📸 Test Results",
+        color=discord.Color.green() if success1 and not success2 else discord.Color.red()
+    )
+    
+    result_embed.add_field(
+        name="First Send",
+        value="✅ Success" if success1 else "❌ Failed",
+        inline=True
+    )
+    
+    result_embed.add_field(
+        name="Second Send (Duplicate)",
+        value="🚫 Blocked (Good!)" if not success2 else "❌ Not Blocked (Bad!)",
+        inline=True
+    )
+    
+    if success1 and not success2:
+        result_embed.add_field(
+            name="✅ Result",
+            value="Duplicate detection is working correctly!",
+            inline=False
+        )
+    else:
+        result_embed.add_field(
+            name="❌ Result",
+            value="Duplicate detection may not be working. Check !audit for details.",
+            inline=False
+        )
+    
+    await ctx.send(embed=result_embed)
 
 @bot.command(name='stop_forward')
 async def stop_forward(ctx):
@@ -1020,7 +1209,8 @@ async def test_instance(ctx):
     success = await send_to_groupme(
         text=test_msg,
         author_name="INSTANCE_TEST",
-        add_instance_id=True
+        add_instance_id=True,
+        message_id=f"test_{ctx.message.id}"
     )
     
     if success:
@@ -1043,12 +1233,17 @@ async def find_duplicates(ctx):
         await send_to_groupme(
             text=test_msg,
             author_name="DUPLICATE_CHECK",
-            add_instance_id=True
+            add_instance_id=True,
+            message_id=f"dup_test_{ctx.message.id}_{i}"
         )
         await asyncio.sleep(1)
     
     await ctx.send("Check GroupMe for messages. If you see messages from different instance IDs, "
-                  "you have multiple bots running!")
+                  "you have multiple bots running!\n\n"
+                  "**For duplicate images:**\n"
+                  "• Check !audit for 'duplicate_image_blocked' events\n"
+                  "• Use !debug_images to see tracked image uploads\n"
+                  "• Use !reset_tracking to clear all tracking if needed")
 
 @bot.command(name='reset_tracking')
 async def reset_tracking(ctx):
@@ -1059,9 +1254,11 @@ async def reset_tracking(ctx):
     with tracking_lock:
         discord_count = len(processed_discord_ids)
         groupme_count = len(processed_groupme_ids)
+        image_count = len(processed_discord_images)
         
         processed_discord_ids.clear()
         processed_groupme_ids.clear()
+        processed_discord_images.clear()
     
     with processing_lock:
         proc_count = len(currently_processing)
@@ -1072,6 +1269,7 @@ async def reset_tracking(ctx):
     await ctx.send(f"🧹 Tracking reset!\n"
                   f"Cleared {discord_count} Discord IDs\n"
                   f"Cleared {groupme_count} GroupMe IDs\n"
+                  f"Cleared {image_count} image uploads\n"
                   f"Cleared {proc_count} processing locks")
 
 @bot.command(name='health')
@@ -1152,6 +1350,7 @@ async def groupme_test(ctx):
     
     start_time = time.time()
     try:
+        # Note: Not using send_to_groupme to bypass duplicate checking for testing
         response = await make_http_request(GROUPME_POST_URL, 'POST', test_payload, is_groupme_post=True)
         duration = time.time() - start_time
         
