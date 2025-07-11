@@ -42,6 +42,7 @@ PORT = int(os.getenv("PORT", "8080"))
 # API Endpoints
 GROUPME_POST_URL = "https://api.groupme.com/v3/bots/post"
 GROUPME_MESSAGES_URL = f"https://api.groupme.com/v3/groups/{GROUPME_GROUP_ID}/messages"
+GROUPME_IMAGE_UPLOAD_URL = "https://image.groupme.com/pictures"
 
 # Discord Bot Setup
 intents = discord.Intents.default()
@@ -294,8 +295,46 @@ async def convert_discord_mentions_to_nicknames(text):
 # MESSAGE SENDING FUNCTIONS
 # ============================================================================
 
-async def send_to_groupme(text, author_name=None, reply_context=None, add_instance_id=False):
-    """Send message to GroupMe - NO RETRIES"""
+async def upload_image_to_groupme(image_url):
+    """Upload an image to GroupMe's image service"""
+    try:
+        if not GROUPME_ACCESS_TOKEN:
+            logger.error("❌ GROUPME_ACCESS_TOKEN not configured for image upload")
+            return None
+        
+        # Download image from Discord
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    logger.error(f"Failed to download image from Discord: {resp.status}")
+                    return None
+                image_data = await resp.read()
+                content_type = resp.headers.get('Content-Type', 'image/png')
+        
+        # Upload to GroupMe
+        headers = {
+            'X-Access-Token': GROUPME_ACCESS_TOKEN,
+            'Content-Type': content_type
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(GROUPME_IMAGE_UPLOAD_URL, data=image_data, headers=headers) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    image_url = result['payload']['url']
+                    logger.info(f"✅ Image uploaded to GroupMe: {image_url}")
+                    return image_url
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"❌ Failed to upload image to GroupMe: {resp.status} - {error_text}")
+                    return None
+                    
+    except Exception as e:
+        logger.error(f"❌ Error uploading image to GroupMe: {e}")
+        return None
+
+async def send_to_groupme(text, author_name=None, reply_context=None, add_instance_id=False, image_urls=None):
+    """Send message to GroupMe - NO RETRIES except for 500 errors"""
     start_time = time.time()
     
     try:
@@ -325,31 +364,63 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
         if len(text) > 1000:
             text = text[:997] + "..."
         
+        # Build payload
         payload = {"bot_id": GROUPME_BOT_ID, "text": text}
         
-        audit_message('groupme_send_start', 'N/A', f"Sending: {text[:50]}...")
+        # Add image attachments if provided
+        if image_urls:
+            attachments = []
+            for img_url in image_urls:
+                logger.info(f"📸 Uploading image to GroupMe: {img_url}")
+                groupme_image_url = await upload_image_to_groupme(img_url)
+                if groupme_image_url:
+                    attachments.append({
+                        "type": "image",
+                        "url": groupme_image_url
+                    })
+                else:
+                    logger.warning(f"⚠️ Failed to upload image, will note in message")
+                    text += " [Image upload failed]"
+            
+            if attachments:
+                payload["attachments"] = attachments
+                logger.info(f"📎 Added {len(attachments)} image attachment(s) to message")
         
-        # NO RETRIES for GroupMe posts
-        response = await make_http_request(GROUPME_POST_URL, 'POST', payload, is_groupme_post=True)
+        audit_message('groupme_send_start', 'N/A', f"Sending: {text[:50]}... with {len(image_urls) if image_urls else 0} images")
         
-        duration = time.time() - start_time
-        success = response['status'] == 202
-        
-        audit_message('groupme_send_result', 'N/A', 
-                     f"Status={response['status']}, Duration={duration:.3f}s, Success={success}")
-        
-        with health_stats_lock:
+        # Try up to 3 times ONLY for 500 errors
+        for attempt in range(3):
+            response = await make_http_request(GROUPME_POST_URL, 'POST', payload, is_groupme_post=True)
+            
+            duration = time.time() - start_time
+            success = response['status'] == 202
+            
+            audit_message('groupme_send_result', 'N/A', 
+                         f"Status={response['status']}, Duration={duration:.3f}s, Success={success}, Attempt={attempt+1}")
+            
             if success:
-                health_stats["discord_to_groupme_sent"] += 1
-                health_stats["last_discord_to_groupme"] = time.time()
-            
-        if success:
-            logger.info(f"✅ Message sent to GroupMe in {duration:.3f}s: {text[:50]}...")
-        else:
-            logger.error(f"❌ Failed to send to GroupMe: HTTP {response['status']} in {duration:.3f}s")
-            logger.error(f"Response body: {response.get('text', 'No response')[:200]}")
-            
-        return success
+                with health_stats_lock:
+                    health_stats["discord_to_groupme_sent"] += 1
+                    health_stats["last_discord_to_groupme"] = time.time()
+                logger.info(f"✅ Message sent to GroupMe in {duration:.3f}s: {text[:50]}...")
+                return True
+            elif response['status'] >= 500 and attempt < 2:
+                # Retry for server errors
+                wait_time = 2 ** attempt
+                logger.warning(f"🚨 GroupMe server error (500), retrying in {wait_time}s... (attempt {attempt+1}/3)")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                # Don't retry for client errors (400s) or after max attempts
+                logger.error(f"❌ Failed to send to GroupMe: HTTP {response['status']} in {duration:.3f}s")
+                logger.error(f"Response body: {response.get('text', 'No response')[:500]}")
+                # Log more details for 500 errors
+                if response['status'] >= 500:
+                    logger.error("🚨 GroupMe server error - this is on their end, not yours!")
+                    logger.error(f"Full response: {response}")
+                return False
+        
+        return False
             
     except Exception as e:
         duration = time.time() - start_time
@@ -704,15 +775,24 @@ async def on_message(message):
             discord_nickname = message.author.display_name
             message_content = message.content or ""
             
-            # Handle attachments
+            # Collect image URLs
+            image_urls = []
             if message.attachments:
-                if message_content:
-                    message_content += " [Attachment]"
-                else:
+                for attachment in message.attachments:
+                    # Check if it's an image
+                    if attachment.content_type and attachment.content_type.startswith('image/'):
+                        image_urls.append(attachment.url)
+                        logger.info(f"📸 Found image attachment: {attachment.filename}")
+                    else:
+                        # For non-image attachments, just note them
+                        message_content += f" [{attachment.filename}]"
+                
+                # Only add [Attachment] text if there were no images
+                if not image_urls and not message_content:
                     message_content = "[Attachment]"
             
-            # Skip empty messages
-            if not message_content.strip():
+            # Skip empty messages (unless there are images)
+            if not message_content.strip() and not image_urls:
                 logger.info(f"⏩ Skipping empty message {message_id}")
                 audit_message('discord_empty_skipped', message_id, "Empty message")
                 return
@@ -744,12 +824,15 @@ async def on_message(message):
             
             # Send DIRECTLY to GroupMe
             logger.info(f"📤 Sending Discord message {message_id} directly to GroupMe")
-            audit_message('discord_sending_to_groupme', message_id, f"From {discord_nickname}")
+            if image_urls:
+                logger.info(f"📸 Including {len(image_urls)} image(s)")
+            audit_message('discord_sending_to_groupme', message_id, f"From {discord_nickname} with {len(image_urls)} images")
             
             success = await send_to_groupme(
                 text=message_content,
                 author_name=discord_nickname,
-                reply_context=reply_context
+                reply_context=reply_context,
+                image_urls=image_urls
             )
             
             if success:
@@ -820,9 +903,10 @@ async def status(ctx):
     status_msg = f"""🟢 **Bridge Status**
 🆔 Instance: `{BOT_INSTANCE_ID}`
 🔗 GroupMe Bot: {'✅' if GROUPME_BOT_ID else '❌'}
-🔑 Access Token: {'✅' if GROUPME_ACCESS_TOKEN else '❌'}
+🔑 Access Token: {'✅' if GROUPME_ACCESS_TOKEN else '❌'} (needed for images)
 🌐 Webhook Server: ✅
 🚦 Discord→GroupMe: {'✅ ENABLED' if DISCORD_TO_GROUPME_ENABLED else '🛑 DISABLED'}
+📸 Image Support: {'✅' if GROUPME_ACCESS_TOKEN else '❌ (Access Token required)'}
 
 **📊 Message Statistics:**
 Discord→GroupMe sent: {stats["discord_to_groupme_sent"]}
@@ -1028,11 +1112,103 @@ async def health_report(ctx):
     
     await ctx.send(embed=embed)
 
-@bot.command(name='clear_all')
-async def clear_all(ctx):
-    """Clear all caches and tracking"""
+@bot.command(name='groupme_test')
+async def groupme_test(ctx):
+    """Test GroupMe API directly with detailed diagnostics"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
+    
+    await ctx.send("🧪 Testing GroupMe API with detailed diagnostics...")
+    
+    # Test 1: Check bot configuration
+    embed = discord.Embed(
+        title="🔍 GroupMe API Test",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="Bot ID Present", 
+        value="✅" if GROUPME_BOT_ID else "❌", 
+        inline=True
+    )
+    
+    if GROUPME_BOT_ID:
+        embed.add_field(
+            name="Bot ID Length", 
+            value=f"{len(GROUPME_BOT_ID)} chars", 
+            inline=True
+        )
+        embed.add_field(
+            name="Bot ID Preview", 
+            value=f"{GROUPME_BOT_ID[:8]}...", 
+            inline=True
+        )
+    
+    # Test 2: Send actual test message
+    test_payload = {
+        "bot_id": GROUPME_BOT_ID,
+        "text": f"API test from {BOT_INSTANCE_ID} at {time.strftime('%H:%M:%S')}"
+    }
+    
+    start_time = time.time()
+    try:
+        response = await make_http_request(GROUPME_POST_URL, 'POST', test_payload, is_groupme_post=True)
+        duration = time.time() - start_time
+        
+        embed.add_field(
+            name="Response Time", 
+            value=f"{duration:.3f}s", 
+            inline=True
+        )
+        embed.add_field(
+            name="Status Code", 
+            value=response['status'], 
+            inline=True
+        )
+        embed.add_field(
+            name="Success", 
+            value="✅" if response['status'] == 202 else "❌", 
+            inline=True
+        )
+        
+        if response['status'] != 202:
+            response_preview = response.get('text', 'No response')[:200]
+            embed.add_field(
+                name="Error Response", 
+                value=f"```{response_preview}```", 
+                inline=False
+            )
+            
+            # Specific error guidance
+            if response['status'] == 400:
+                embed.add_field(
+                    name="💡 400 Bad Request", 
+                    value="Check if bot_id is correct and bot still exists", 
+                    inline=False
+                )
+            elif response['status'] == 404:
+                embed.add_field(
+                    name="💡 404 Not Found", 
+                    value="Bot may have been deleted. Create a new one at dev.groupme.com", 
+                    inline=False
+                )
+            elif response['status'] >= 500:
+                embed.add_field(
+                    name="🚨 Server Error", 
+                    value="GroupMe is having issues. Wait and try again later.", 
+                    inline=False
+                )
+        
+    except Exception as e:
+        embed.add_field(
+            name="❌ Error", 
+            value=str(e)[:200], 
+            inline=False
+        )
+    
+    await ctx.send(embed=embed)
+
+# Add to the commands section
     
     # Clear tracking
     with tracking_lock:
@@ -1079,6 +1255,9 @@ def main():
         logger.error("❌ DISCORD_CHANNEL_ID required!")
         return
     
+    if not GROUPME_ACCESS_TOKEN:
+        logger.warning("⚠️ GROUPME_ACCESS_TOKEN not set - image uploads will not work!")
+    
     logger.info("🚀 Starting Enhanced Bridge with Debugging...")
     logger.info(f"🆔 Instance ID: {BOT_INSTANCE_ID}")
     logger.info("✅ Discord→GroupMe: DIRECT (no queue, no retries)")
@@ -1087,6 +1266,7 @@ def main():
     logger.info("✅ Audit logging enabled")
     logger.info("✅ Race condition prevention")
     logger.info("✅ Emergency stop switch")
+    logger.info(f"📸 Image support: {'✅ ENABLED' if GROUPME_ACCESS_TOKEN else '❌ DISABLED (set GROUPME_ACCESS_TOKEN)'}")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
