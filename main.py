@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced GroupMe-Discord Bridge with Reliability and Robust Anti-Duplication Features
+Enhanced GroupMe-Discord Bridge with Fixed Discord->GroupMe Flow
 """
 
 import discord
@@ -19,18 +19,14 @@ from aiohttp import web
 import logging
 from typing import Dict, Any, Optional, List, Tuple, Set
 
-# Configure logging with more detail for debugging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Enable debug logging for the duplicate detector specifically
-dup_logger = logging.getLogger('duplicate_detector')
-dup_logger.setLevel(logging.DEBUG)
-
-print("🔥 ENHANCED BIDIRECTIONAL BRIDGE WITH BULLETPROOF ANTI-DUPLICATION STARTING!")
+print("🔥 FIXED BIDIRECTIONAL BRIDGE - NO DISCORD->GROUPME DUPLICATES!")
 
 # Environment Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -51,402 +47,37 @@ intents.reactions = True
 intents.guilds = True
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# Enhanced Global State with Thread Safety
+# Global State
 bot_status = {"ready": False, "start_time": time.time()}
-message_mapping = {}
 reply_context_cache = {}
 recent_discord_messages = deque(maxlen=20)
 recent_groupme_messages = deque(maxlen=20)
 
 # Thread-safe locks
-mapping_lock = threading.Lock()
 cache_lock = threading.Lock()
 discord_messages_lock = threading.Lock()
 groupme_messages_lock = threading.Lock()
 
-# Message Queue System
-message_queue = asyncio.Queue(maxsize=1000)
-failed_messages = deque(maxlen=100)
-failed_messages_lock = threading.Lock()
+# SIMPLE Message Tracking - Just IDs, nothing fancy
+processed_discord_ids = set()
+processed_groupme_ids = set()
+tracking_lock = threading.Lock()
 
-# Persistence file
-FAILED_MESSAGES_FILE = "failed_messages.json"
+# Message Queue - ONLY for GroupMe->Discord now
+groupme_to_discord_queue = asyncio.Queue(maxsize=100)
 
-# Health monitoring stats
+# Health stats
 health_stats = {
-    "messages_sent": 0,
-    "messages_failed": 0,
-    "last_success": time.time(),
-    "last_failure": None,
-    "queue_size": 0
+    "discord_to_groupme_sent": 0,
+    "groupme_to_discord_sent": 0,
+    "last_discord_to_groupme": None,
+    "last_groupme_to_discord": None,
+    "duplicates_blocked": 0
 }
 health_stats_lock = threading.Lock()
 
-# Message retry configuration
-MAX_RETRIES = 3
-RETRY_DELAY_BASE = 2
-
-# Message synchronization tracking
-sync_tracking = {
-    "discord_messages": {},
-    "groupme_messages": {},
-    "verification_history": deque(maxlen=10),
-    "last_sync_check": 0,
-    "synced_messages": deque(maxlen=500)
-}
-sync_tracking_lock = threading.Lock()
-
-# Synchronization check interval (in seconds) - DISABLED to prevent triplets
-SYNC_CHECK_INTERVAL = 3600  # Increased to 1 hour instead of 10 minutes
-SYNC_MESSAGE_WINDOW = 3600  # Check messages from last hour
-AUTO_REQUEUE_MISSING = False  # KEEP DISABLED - was causing duplicate sends
-MAX_RESYNC_MESSAGES = 5  # Reduced from 10
-
-# ============================================================================
-# ROBUST DUPLICATE DETECTION SYSTEM
-# ============================================================================
-
-class RobustDuplicateDetector:
-    """Thread-safe, multi-layered duplicate detection system"""
-    
-    def __init__(self):
-        # Thread safety locks
-        self._lock = threading.RLock()
-        
-        # Message ID tracking
-        self.processed_message_ids: Set[str] = set()
-        self.message_id_timestamps: Dict[str, float] = {}
-        
-        # Content-based duplicate detection
-        self.content_hashes: Dict[str, float] = {}
-        
-        # Enhanced rate limiting per user
-        self.user_last_message: Dict[str, float] = {}
-        self.user_recent_messages: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
-        
-        # Queue-level duplicate tracking
-        self.queued_message_hashes: Set[str] = set()
-        
-        # Webhook duplicate detection
-        self.webhook_request_ids: Dict[str, float] = {}
-        
-        # Configuration - Made less aggressive
-        self.RATE_LIMIT_SECONDS = 0.05  # Only block messages < 50ms apart
-        self.CONTENT_DUPLICATE_WINDOW = 120  # Reduced from 5 minutes to 2 minutes
-        self.MESSAGE_ID_TTL = 1800  # Reduced from 1 hour to 30 minutes
-        self.MAX_MESSAGES_PER_MINUTE = 20  # Increased from 15
-        self.WEBHOOK_DUPLICATE_WINDOW = 15  # Reduced from 30 seconds
-        
-        # Temporary disable mechanism for debugging
-        self.temporarily_disabled = False
-        
-        # Statistics
-        self.stats = {
-            'total_checked': 0,
-            'duplicates_blocked': 0,
-            'rate_limited': 0,
-            'content_duplicates': 0,
-            'id_duplicates': 0,
-            'webhook_duplicates': 0,
-            'queue_duplicates': 0
-        }
-    
-    def _generate_content_hash(self, content: str, author: str, platform: str) -> str:
-        """Generate hash for content-based duplicate detection"""
-        # Normalize content
-        normalized = content.strip().lower()
-        normalized = normalized.replace('\n', ' ').replace('\r', '')
-        normalized = ' '.join(normalized.split())
-        
-        # Create hash including author and platform
-        hash_data = f"{normalized}:{author}:{platform}"
-        return hashlib.md5(hash_data.encode()).hexdigest()
-    
-    def _generate_queue_hash(self, message_data: Dict[str, Any]) -> str:
-        """Generate hash for queue-level duplicate detection"""
-        content = str(message_data.get('text', ''))
-        author = str(message_data.get('name', ''))
-        msg_type = str(message_data.get('type', ''))
-        
-        hash_data = f"{content}:{author}:{msg_type}:{int(time.time() // 60)}"
-        return hashlib.md5(hash_data.encode()).hexdigest()
-    
-    def _cleanup_old_data(self):
-        """Remove old tracking data to prevent memory leaks"""
-        current_time = time.time()
-        cleanup_count = 0
-        
-        # Clean old message IDs (platform-specific)
-        expired_ids = [
-            msg_id for msg_id, timestamp in self.message_id_timestamps.items()
-            if current_time - timestamp > self.MESSAGE_ID_TTL
-        ]
-        for msg_id in expired_ids:
-            self.processed_message_ids.discard(msg_id)
-            self.message_id_timestamps.pop(msg_id, None)
-            cleanup_count += 1
-        
-        # Clean old content hashes
-        expired_hashes = [
-            content_hash for content_hash, timestamp in self.content_hashes.items()
-            if current_time - timestamp > self.CONTENT_DUPLICATE_WINDOW
-        ]
-        for content_hash in expired_hashes:
-            self.content_hashes.pop(content_hash, None)
-            cleanup_count += 1
-        
-        # Clean old webhook requests
-        expired_webhooks = [
-            req_id for req_id, timestamp in self.webhook_request_ids.items()
-            if current_time - timestamp > self.WEBHOOK_DUPLICATE_WINDOW
-        ]
-        for req_id in expired_webhooks:
-            self.webhook_request_ids.pop(req_id, None)
-            cleanup_count += 1
-        
-        # Clean old user rate limit data
-        expired_users = []
-        for user_id, msgs in self.user_recent_messages.items():
-            # Remove old messages from each user's deque
-            while msgs and current_time - msgs[0] > 300:  # 5 minutes
-                msgs.popleft()
-            # If no recent messages, remove the user entirely
-            if not msgs:
-                expired_users.append(user_id)
-        
-        for user_id in expired_users:
-            self.user_recent_messages.pop(user_id, None)
-            cleanup_count += 1
-        
-        if cleanup_count > 0:
-            logger.debug(f"🧹 Cleaned up {cleanup_count} expired duplicate detection entries")
-    
-    def reset_all_caches(self):
-        """Reset all caches - useful for debugging"""
-        with self._lock:
-            old_counts = {
-                'message_ids': len(self.processed_message_ids),
-                'content_hashes': len(self.content_hashes),
-                'queue_hashes': len(self.queued_message_hashes),
-                'webhook_requests': len(self.webhook_request_ids),
-                'user_tracking': len(self.user_recent_messages)
-            }
-            
-            self.processed_message_ids.clear()
-            self.message_id_timestamps.clear()
-            self.content_hashes.clear()
-            self.queued_message_hashes.clear()
-            self.webhook_request_ids.clear()
-            self.user_recent_messages.clear()
-            
-            logger.info(f"🧹 Reset all caches: {old_counts}")
-            return old_counts
-    
-    def check_webhook_duplicate(self, request_id: str = None, 
-                              client_ip: str = None, 
-                              message_data: Dict = None) -> bool:
-        """Check for webhook-level duplicates"""
-        with self._lock:
-            current_time = time.time()
-            
-            if not request_id:
-                msg_id = message_data.get('id', '')
-                content = message_data.get('text', '')[:50]
-                request_id = f"{msg_id}:{content}:{client_ip}"
-            
-            if request_id in self.webhook_request_ids:
-                time_diff = current_time - self.webhook_request_ids[request_id]
-                if time_diff < self.WEBHOOK_DUPLICATE_WINDOW:
-                    logger.warning(f"🚫 Webhook duplicate detected: {request_id} (last seen {time_diff:.1f}s ago)")
-                    self.stats['webhook_duplicates'] += 1
-                    self.stats['duplicates_blocked'] += 1
-                    return True
-            
-            self.webhook_request_ids[request_id] = current_time
-            return False
-    
-    def temporarily_disable(self, seconds: int = 60):
-        """Temporarily disable duplicate detection for debugging"""
-        with self._lock:
-            self.temporarily_disabled = True
-            logger.warning(f"🔓 Duplicate detection temporarily disabled for {seconds} seconds")
-        
-        def re_enable():
-            time.sleep(seconds)
-            with self._lock:
-                self.temporarily_disabled = False
-                logger.info("🔒 Duplicate detection re-enabled")
-        
-        threading.Thread(target=re_enable, daemon=True).start()
-    
-    def check_message_duplicate(self, message_data: Dict[str, Any], 
-                              platform: str = "unknown", 
-                              skip_content_check: bool = False) -> Tuple[bool, str]:
-        """Comprehensive duplicate detection"""
-        with self._lock:
-            # If temporarily disabled, only check for basic duplicates
-            if self.temporarily_disabled:
-                msg_id = message_data.get('id')
-                if msg_id:
-                    platform_msg_id = f"{platform}:{msg_id}"
-                    if platform_msg_id in self.processed_message_ids:
-                        return True, "message_id_duplicate"
-                    self.processed_message_ids.add(platform_msg_id)
-                    self.message_id_timestamps[platform_msg_id] = time.time()
-                return False, "not_duplicate_disabled"
-            
-            self.stats['total_checked'] += 1
-            current_time = time.time()
-            
-            # Cleanup old data periodically
-            if self.stats['total_checked'] % 50 == 0:  # More frequent cleanup
-                self._cleanup_old_data()
-            
-            msg_id = message_data.get('id')
-            content = message_data.get('text', '')
-            author = message_data.get('name', 'Unknown')
-            user_id = message_data.get('user_id', message_data.get('sender_id', ''))
-            
-            # Create platform-specific message ID to prevent cross-platform conflicts
-            platform_msg_id = f"{platform}:{msg_id}" if msg_id else None
-            
-            logger.debug(f"🔍 Checking message: {platform_msg_id} from {author} on {platform}")
-            
-            # 1. Message ID duplicate check (platform-specific)
-            if platform_msg_id and platform_msg_id in self.processed_message_ids:
-                time_since = current_time - self.message_id_timestamps.get(platform_msg_id, 0)
-                logger.info(f"🚫 ID duplicate: {platform_msg_id} (last seen {time_since:.1f}s ago)")
-                self.stats['id_duplicates'] += 1
-                self.stats['duplicates_blocked'] += 1
-                return True, "message_id_duplicate"
-            
-            # 2. Content-based duplicate check (can be skipped)
-            if not skip_content_check and content.strip():
-                content_hash = self._generate_content_hash(content, author, platform)
-                if content_hash in self.content_hashes:
-                    time_since = current_time - self.content_hashes[content_hash]
-                    if time_since < self.CONTENT_DUPLICATE_WINDOW:
-                        logger.info(f"🚫 Content duplicate from {author}: {content[:30]}... (last seen {time_since:.1f}s ago)")
-                        self.stats['content_duplicates'] += 1
-                        self.stats['duplicates_blocked'] += 1
-                        return True, "content_duplicate"
-                
-                self.content_hashes[content_hash] = current_time
-            
-            # 3. Enhanced rate limiting (more lenient)
-            if user_id:
-                platform_user_id = f"{platform}:{user_id}"
-                recent_msgs = self.user_recent_messages[platform_user_id]
-                
-                # Remove old messages
-                while recent_msgs and current_time - recent_msgs[0] > 60:
-                    recent_msgs.popleft()
-                
-                # Check rate limit (only for extreme cases)
-                if len(recent_msgs) >= self.MAX_MESSAGES_PER_MINUTE:
-                    logger.warning(f"🚫 Rate limit exceeded for {author}: {len(recent_msgs)} msgs/min")
-                    self.stats['rate_limited'] += 1
-                    self.stats['duplicates_blocked'] += 1
-                    return True, "rate_limit_exceeded"
-                
-                # Very lenient time check - only block super rapid messages
-                if recent_msgs and current_time - recent_msgs[-1] < 0.05:  # 50ms
-                    time_diff = current_time - recent_msgs[-1]
-                    logger.info(f"🚫 Rate limited: {author} (waited {time_diff:.3f}s)")
-                    self.stats['rate_limited'] += 1
-                    self.stats['duplicates_blocked'] += 1
-                    return True, "rate_limit_too_fast"
-                
-                recent_msgs.append(current_time)
-            
-            # 4. Record message as processed (platform-specific)
-            if platform_msg_id:
-                self.processed_message_ids.add(platform_msg_id)
-                self.message_id_timestamps[platform_msg_id] = current_time
-                logger.debug(f"✅ Recorded new message: {platform_msg_id}")
-            
-            return False, "not_duplicate"
-    
-    def check_queue_duplicate(self, message_data: Dict[str, Any]) -> bool:
-        """Check if message is already queued for processing"""
-        with self._lock:
-            queue_hash = self._generate_queue_hash(message_data)
-            
-            if queue_hash in self.queued_message_hashes:
-                logger.info(f"🚫 Queue duplicate detected: {message_data.get('name', 'Unknown')}")
-                self.stats['queue_duplicates'] += 1
-                self.stats['duplicates_blocked'] += 1
-                return True
-            
-            self.queued_message_hashes.add(queue_hash)
-            
-            # Keep queue tracking size manageable
-            if len(self.queued_message_hashes) > 1000:
-                old_hashes = list(self.queued_message_hashes)[:200]
-                for old_hash in old_hashes:
-                    self.queued_message_hashes.discard(old_hash)
-            
-            return False
-    
-    def mark_message_processed(self, message_data: Dict[str, Any], platform: str = "unknown"):
-        """Mark a message as successfully processed"""
-        with self._lock:
-            queue_hash = self._generate_queue_hash(message_data)
-            self.queued_message_hashes.discard(queue_hash)
-            
-            # Also remove from processed message IDs if it's been too long
-            msg_id = message_data.get('id')
-            if msg_id:
-                platform_msg_id = f"{platform}:{msg_id}"
-                # Remove old entries to prevent buildup
-                current_time = time.time()
-                if platform_msg_id in self.message_id_timestamps:
-                    if current_time - self.message_id_timestamps[platform_msg_id] > 300:  # 5 minutes
-                        self.processed_message_ids.discard(platform_msg_id)
-                        self.message_id_timestamps.pop(platform_msg_id, None)
-                        logger.debug(f"🗑️ Removed old processed message: {platform_msg_id}")
-    
-    def is_system_overloaded(self) -> bool:
-        """Check if system is overloaded"""
-        with self._lock:
-            current_time = time.time()
-            recent_blocks = sum(1 for timestamp in self.content_hashes.values() 
-                           if current_time - timestamp < 60)
-            return recent_blocks > 50
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get duplicate detection statistics"""
-        with self._lock:
-            stats = self.stats.copy()
-            total_checked = max(1, self.stats['total_checked'])
-            duplicate_rate = (self.stats['duplicates_blocked'] / total_checked) * 100
-            
-            stats.update({
-                'processed_ids_count': len(self.processed_message_ids),
-                'content_hashes_count': len(self.content_hashes),
-                'queued_hashes_count': len(self.queued_message_hashes),
-                'webhook_requests_count': len(self.webhook_request_ids),
-                'duplicate_rate': duplicate_rate,
-                'system_overloaded': self.is_system_overloaded(),
-                'temporarily_disabled': self.temporarily_disabled
-            })
-            return stats
-    
-    def reset_stats(self):
-        """Reset statistics"""
-        with self._lock:
-            self.stats = {
-                'total_checked': 0,
-                'duplicates_blocked': 0,
-                'rate_limited': 0,
-                'content_duplicates': 0,
-                'id_duplicates': 0,
-                'webhook_duplicates': 0,
-                'queue_duplicates': 0
-            }
-
-# Global duplicate detector instance
-duplicate_detector = RobustDuplicateDetector()
+# Disable all sync verification to prevent duplicates
+SYNC_VERIFICATION_ENABLED = False
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -459,57 +90,6 @@ async def wait_for_bot_ready(timeout=30):
         await asyncio.sleep(0.5)
     return bot.is_ready()
 
-def update_health_stats(success: bool):
-    """Update health monitoring statistics"""
-    with health_stats_lock:
-        if success:
-            health_stats["messages_sent"] += 1
-            health_stats["last_success"] = time.time()
-        else:
-            health_stats["messages_failed"] += 1
-            health_stats["last_failure"] = time.time()
-
-def save_failed_messages():
-    """Persist failed messages to disk"""
-    try:
-        with failed_messages_lock:
-            if failed_messages:
-                with open(FAILED_MESSAGES_FILE, 'w') as f:
-                    messages = list(failed_messages)
-                    json.dump(messages, f)
-                logger.info(f"💾 Saved {len(messages)} failed messages to disk")
-    except Exception as e:
-        logger.error(f"❌ Error saving failed messages: {e}")
-
-def load_failed_messages():
-    """Load and retry previously failed messages"""
-    try:
-        if os.path.exists(FAILED_MESSAGES_FILE):
-            with open(FAILED_MESSAGES_FILE, 'r') as f:
-                messages = json.load(f)
-                logger.info(f"📥 Loaded {len(messages)} failed messages from disk")
-                return messages
-    except Exception as e:
-        logger.error(f"❌ Error loading failed messages: {e}")
-    return []
-
-def generate_message_hash(content: str, author: str, timestamp: float) -> str:
-    """Generate a unique hash for a message to track duplicates"""
-    data = f"{content}:{author}:{int(timestamp)}"
-    return hashlib.md5(data.encode()).hexdigest()
-
-def is_message_already_synced(content: str, author: str, timestamp: float) -> bool:
-    """Check if a message has already been synced to prevent duplicates"""
-    msg_hash = generate_message_hash(content, author, timestamp)
-    with sync_tracking_lock:
-        return msg_hash in sync_tracking['synced_messages']
-
-def mark_message_as_synced(content: str, author: str, timestamp: float):
-    """Mark a message as synced to prevent future duplicates"""
-    msg_hash = generate_message_hash(content, author, timestamp)
-    with sync_tracking_lock:
-        sync_tracking['synced_messages'].append(msg_hash)
-
 def is_bot_message(data):
     """Check if message is from a bot"""
     if data.get('sender_type') == 'bot':
@@ -521,7 +101,7 @@ def is_bot_message(data):
         return True
     return False
 
-# Enhanced HTTP request with retry logic
+# HTTP request helper
 async def make_http_request(url, method='GET', data=None, headers=None, retries=3):
     """HTTP request helper with retry logic"""
     for attempt in range(retries):
@@ -547,7 +127,7 @@ async def make_http_request(url, method='GET', data=None, headers=None, retries=
                             return result
                 
                 if attempt < retries - 1:
-                    wait_time = RETRY_DELAY_BASE ** attempt
+                    wait_time = 2 ** attempt
                     logger.warning(f"⏳ HTTP {response.status}, retrying in {wait_time}s...")
                     await asyncio.sleep(wait_time)
                 else:
@@ -555,268 +135,19 @@ async def make_http_request(url, method='GET', data=None, headers=None, retries=
                     
             except Exception as e:
                 if attempt < retries - 1:
-                    wait_time = RETRY_DELAY_BASE ** attempt
+                    wait_time = 2 ** attempt
                     logger.warning(f"⏳ HTTP request error: {e}, retrying in {wait_time}s...")
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"❌ HTTP request failed after {retries} attempts: {e}")
                     return {'status': 500, 'data': None, 'text': str(e)}
 
-async def get_groupme_messages(group_id, limit=20):
-    """Get recent GroupMe messages"""
-    if not GROUPME_ACCESS_TOKEN:
-        return []
-    
-    url = f"{GROUPME_MESSAGES_URL}?token={GROUPME_ACCESS_TOKEN}&limit={limit}"
-    response = await make_http_request(url)
-    if response['status'] == 200 and response['data']:
-        return response['data'].get('response', {}).get('messages', [])
-    return []
-
-async def fetch_recent_discord_messages(limit=100):
-    """Fetch recent messages from Discord channel"""
-    try:
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        if not channel:
-            return []
-        
-        messages = []
-        after_time = datetime.utcnow() - timedelta(seconds=SYNC_MESSAGE_WINDOW)
-        
-        async for message in channel.history(limit=limit, after=after_time):
-            # Skip bot messages AND commands
-            if not message.author.bot and not message.content.startswith('!'):
-                messages.append({
-                    'id': str(message.id),
-                    'content': message.content,
-                    'author': message.author.display_name,
-                    'timestamp': message.created_at.timestamp(),
-                    'has_attachments': len(message.attachments) > 0,
-                    'raw_message': message
-                })
-        
-        return messages
-    except Exception as e:
-        logger.error(f"Error fetching Discord messages: {e}")
-        return []
-
-async def fetch_recent_groupme_messages_detailed(limit=100):
-    """Fetch recent messages from GroupMe with full details"""
-    try:
-        messages = await get_groupme_messages(GROUPME_GROUP_ID, limit)
-        current_time = time.time()
-        
-        filtered_messages = []
-        for msg in messages:
-            if msg.get('sender_type') != 'bot' and (current_time - msg.get('created_at', 0)) <= SYNC_MESSAGE_WINDOW:
-                filtered_messages.append({
-                    'id': msg.get('id'),
-                    'content': msg.get('text', ''),
-                    'author': msg.get('name', 'Unknown'),
-                    'timestamp': msg.get('created_at', 0),
-                    'has_attachments': bool(msg.get('attachments', [])),
-                    'raw_message': msg
-                })
-        
-        return filtered_messages
-    except Exception as e:
-        logger.error(f"Error fetching GroupMe messages: {e}")
-        return []
-
-def normalize_message_content(content):
-    """Normalize message content for comparison"""
-    if not content:
-        return ""
-    
-    # Remove bridge-specific formatting
-    content = re.sub(r'^[^:]+: ', '', content)
-    content = re.sub(r'^\*\*[^*]+\*\*: ', '', content)
-    content = re.sub(r'↪️ \*\*[^*]+\*\*.*?\n\n', '', content, flags=re.DOTALL)
-    
-    # Normalize whitespace
-    content = ' '.join(content.split())
-    
-    return content.lower().strip()
-
-def find_matching_message(message, target_messages, time_tolerance=60):
-    """Find a matching message in the target platform"""
-    normalized_content = normalize_message_content(message['content'])
-    if not normalized_content and not message.get('has_attachments'):
-        return None
-    
-    for target_msg in target_messages:
-        time_diff = abs(message['timestamp'] - target_msg['timestamp'])
-        if time_diff > time_tolerance:
-            continue
-        
-        target_normalized = normalize_message_content(target_msg['content'])
-        
-        if not normalized_content and not target_normalized:
-            if message.get('has_attachments') and target_msg.get('has_attachments'):
-                return target_msg
-        
-        if normalized_content and target_normalized and normalized_content == target_normalized:
-            return target_msg
-        
-        if normalized_content and target_normalized:
-            if normalized_content in target_normalized or target_normalized in normalized_content:
-                return target_msg
-    
-    return None
-
-async def verify_message_sync():
-    """Verify that messages are properly synced between platforms"""
-    try:
-        logger.info("🔍 Starting message synchronization verification...")
-        
-        discord_messages = await fetch_recent_discord_messages()
-        groupme_messages = await fetch_recent_groupme_messages_detailed()
-        
-        logger.info(f"📊 Found {len(discord_messages)} Discord messages and {len(groupme_messages)} GroupMe messages")
-        
-        missing_on_groupme = []
-        missing_on_discord = []
-        
-        # Check Discord -> GroupMe
-        for discord_msg in discord_messages:
-            match = find_matching_message(discord_msg, groupme_messages)
-            if not match:
-                if not is_message_already_synced(discord_msg['content'], discord_msg['author'], discord_msg['timestamp']):
-                    missing_on_groupme.append(discord_msg)
-        
-        # Check GroupMe -> Discord
-        for groupme_msg in groupme_messages:
-            match = find_matching_message(groupme_msg, discord_messages)
-            if not match:
-                if not is_message_already_synced(groupme_msg['content'], groupme_msg['author'], groupme_msg['timestamp']):
-                    missing_on_discord.append(groupme_msg)
-        
-        # Generate sync report
-        sync_report = {
-            'timestamp': time.time(),
-            'discord_total': len(discord_messages),
-            'groupme_total': len(groupme_messages),
-            'missing_on_groupme': len(missing_on_groupme),
-            'missing_on_discord': len(missing_on_discord),
-            'sync_rate': 100.0
-        }
-        
-        total_unique = len(set(msg['id'] for msg in discord_messages)) + len(set(msg['id'] for msg in groupme_messages))
-        if total_unique > 0:
-            synced = total_unique - len(missing_on_groupme) - len(missing_on_discord)
-            sync_report['sync_rate'] = (synced / total_unique) * 100
-        
-        # Store verification history
-        with sync_tracking_lock:
-            sync_tracking['verification_history'].append(sync_report)
-            sync_tracking['last_sync_check'] = time.time()
-        
-        if missing_on_groupme or missing_on_discord:
-            logger.warning(f"⚠️ SYNC VERIFICATION ISSUE DETECTED:")
-            logger.warning(f"Missing on GroupMe: {len(missing_on_groupme)} messages")
-            logger.warning(f"Missing on Discord: {len(missing_on_discord)} messages")
-            logger.warning(f"Sync Rate: {sync_report['sync_rate']:.1f}%")
-            
-            if missing_on_groupme:
-                logger.info("Missing on GroupMe:")
-                for msg in missing_on_groupme[:5]:
-                    logger.info(f"  - {msg['author']}: {msg['content'][:50]}...")
-            
-            if missing_on_discord:
-                logger.info("Missing on Discord:")
-                for msg in missing_on_discord[:5]:
-                    logger.info(f"  - {msg['author']}: {msg['content'][:50]}...")
-            
-            if AUTO_REQUEUE_MISSING:
-                logger.info("🔄 Auto-requeue is enabled, re-syncing missing messages...")
-                await resync_missing_messages(missing_on_groupme, missing_on_discord)
-            else:
-                logger.info("🔄 Auto-requeue is disabled, skipping automatic resync (use !syncfix to manually resync)")
-        else:
-            logger.info(f"✅ Sync verification passed! All messages synced properly. Rate: {sync_report['sync_rate']:.1f}%")
-        
-        return sync_report, missing_on_groupme, missing_on_discord
-        
-    except Exception as e:
-        logger.error(f"Error during sync verification: {e}")
-        return None, [], []
-
-async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_discord: List[Dict]):
-    """Resync missing messages without creating duplicates"""
-    resync_to_groupme = missing_on_groupme[:MAX_RESYNC_MESSAGES]
-    resync_to_discord = missing_on_discord[:MAX_RESYNC_MESSAGES]
-    
-    logger.info(f"🔄 Resync requested: {len(resync_to_groupme)} to GroupMe, {len(resync_to_discord)} to Discord")
-    
-    # Resync Discord messages to GroupMe
-    for msg in resync_to_groupme:
-        # Skip if message is very recent
-        if time.time() - msg['timestamp'] < 30:
-            logger.info(f"⏩ Skipping recent message from {msg['author']} (too recent)")
-            continue
-            
-        # Skip commands that somehow got through
-        if msg['content'].startswith('!'):
-            logger.info(f"⏩ Skipping command message: {msg['content']}")
-            continue
-        
-        mark_message_as_synced(msg['content'], msg['author'], msg['timestamp'])
-        
-        logger.info(f"🔄 Re-syncing Discord message from {msg['author']}: {msg['content'][:50]}...")
-        await message_queue.put({
-            'send_func': send_to_groupme,
-            'kwargs': {
-                'text': msg['content'],
-                'author_name': msg['author']
-            },
-            'type': 'sync_recovery_to_groupme',
-            'retries': 0,
-            'original_data': {
-                'text': msg['content'],
-                'name': msg['author'],
-                'id': f"resync_discord_{msg['id']}",
-                'user_id': 'resync_user'
-            }
-        })
-    
-    # Resync GroupMe messages to Discord
-    for msg in resync_to_discord:
-        if time.time() - msg['timestamp'] < 30:
-            logger.info(f"⏩ Skipping recent message from {msg['author']} (too recent)")
-            continue
-        
-        mark_message_as_synced(msg['content'], msg['author'], msg['timestamp'])
-        
-        logger.info(f"🔄 Re-syncing GroupMe message from {msg['author']}: {msg['content'][:50]}...")
-        await message_queue.put({
-            'send_func': send_to_discord,
-            'kwargs': {
-                'message': msg['raw_message']
-            },
-            'type': 'sync_recovery_to_discord',
-            'retries': 0,
-            'original_data': {
-                'text': msg['content'],
-                'name': msg['author'],
-                'id': f"resync_groupme_{msg['id']}",
-                'user_id': 'resync_user'
-            }
-        })
-    
-    actual_queued = len([m for m in resync_to_groupme if not m['content'].startswith('!') and time.time() - m['timestamp'] >= 30])
-    actual_queued += len([m for m in resync_to_discord if time.time() - m['timestamp'] >= 30])
-    
-    if actual_queued > 0:
-        logger.info(f"✅ Actually queued {actual_queued} messages for resync")
-    else:
-        logger.info("ℹ️ No messages needed resyncing (all recent or filtered)")
-
-# Enhanced reply detection
+# Reply detection
 async def detect_reply_context(data):
-    """Enhanced reply detection"""
+    """Detect if GroupMe message is a reply"""
     reply_context = None
     
-    # Method 1: Official GroupMe reply attachments
+    # Check for official GroupMe reply attachments
     if data.get('attachments'):
         reply_attachment = next(
             (att for att in data['attachments'] if att.get('type') == 'reply'), 
@@ -835,7 +166,7 @@ async def detect_reply_context(data):
                         }
                         logger.info(f"✅ Found official reply to {reply_context['name']}")
     
-    # Method 2: Enhanced @mention detection
+    # Check for @mentions
     if not reply_context and data.get('text'):
         text = data['text']
         mention_match = re.search(r'@(\w+)', text, re.IGNORECASE)
@@ -847,17 +178,13 @@ async def detect_reply_context(data):
                     display_name = discord_msg['author'].lower()
                     username = discord_msg.get('username', '').lower()
                     
-                    if (mentioned_name in display_name or 
-                        mentioned_name in username or
-                        mentioned_name == display_name or
-                        mentioned_name == username):
-                        
+                    if mentioned_name in display_name or mentioned_name in username:
                         reply_context = {
                             'text': discord_msg['content'],
                             'name': discord_msg['author'],
                             'type': 'mention_reply'
                         }
-                        logger.info(f"✅ Found @mention reply to {reply_context['name']} (Discord nickname)")
+                        logger.info(f"✅ Found @mention reply to {reply_context['name']}")
                         break
     
     return reply_context
@@ -903,11 +230,13 @@ async def convert_discord_mentions_to_nicknames(text):
         logger.error(f"❌ Error in mention conversion: {e}")
         return text
 
-# Message sending functions
+# ============================================================================
+# MESSAGE SENDING FUNCTIONS - SIMPLIFIED
+# ============================================================================
+
 async def send_to_groupme(text, author_name=None, reply_context=None):
-    """Send message to GroupMe with proper API handling"""
+    """Send message to GroupMe - DIRECT, NO QUEUE"""
     try:
-        # Check if GroupMe is properly configured
         if not GROUPME_BOT_ID:
             logger.error("❌ GROUPME_BOT_ID not configured")
             return False
@@ -915,6 +244,7 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
         # Convert Discord mentions
         text = await convert_discord_mentions_to_nicknames(text)
         
+        # Format message
         if reply_context:
             quoted_text = reply_context.get('text', 'previous message')
             reply_author = reply_context.get('name', 'Someone')
@@ -925,7 +255,7 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
             if author_name and not text.startswith(author_name):
                 text = f"{author_name}: {text}" if text.strip() else f"{author_name} sent content"
         
-        # GroupMe has message length limits
+        # GroupMe message length limit
         if len(text) > 1000:
             text = text[:997] + "..."
         
@@ -936,35 +266,26 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
         
         # GroupMe bot API returns 202 for success
         success = response['status'] == 202
-        update_health_stats(success)
         
+        with health_stats_lock:
+            if success:
+                health_stats["discord_to_groupme_sent"] += 1
+                health_stats["last_discord_to_groupme"] = time.time()
+            
         if success:
             logger.info(f"✅ Message sent to GroupMe: {text[:50]}...")
         else:
             logger.error(f"❌ Failed to send to GroupMe: HTTP {response['status']}")
-            logger.error(f"Response: {response.get('text', 'No response text')[:200]}")
-            
-            # Log specific error cases
-            if response['status'] == 400:
-                logger.error("Bad request - check bot_id and message format")
-            elif response['status'] == 401:
-                logger.error("Unauthorized - check GroupMe bot configuration")
-            elif response['status'] == 404:
-                logger.error("Not found - bot or group may not exist")
-            elif response['status'] >= 500:
-                logger.error("GroupMe server error - temporary issue")
             
         return success
             
     except Exception as e:
         logger.error(f"❌ Error sending to GroupMe: {e}")
-        update_health_stats(False)
         return False
 
 async def send_to_discord(message, reply_context=None):
-    """Send message to Discord with proper async handling"""
+    """Send message to Discord"""
     try:
-        # Ensure we're in a proper async context
         if not bot.is_ready():
             logger.warning("Bot not ready, cannot send to Discord")
             return False
@@ -983,7 +304,7 @@ async def send_to_discord(message, reply_context=None):
             preview = original_text[:200] + '...' if len(original_text) > 200 else original_text
             content = f"↪️ **{author}** replying to **{original_author}**:\n> {preview}\n\n{content}"
         
-        # Handle images with proper error handling
+        # Handle images
         embeds = []
         try:
             if message.get('attachments'):
@@ -995,24 +316,20 @@ async def send_to_discord(message, reply_context=None):
         except Exception as e:
             logger.warning(f"Error processing attachments: {e}")
         
-        # Send message with proper error handling
+        # Send message
         try:
             formatted_content = f"**{author}:** {content}" if content else f"**{author}** sent an attachment"
             
-            # Ensure content isn't too long for Discord
             if len(formatted_content) > 2000:
                 formatted_content = formatted_content[:1997] + "..."
             
-            # Use asyncio.wait_for to prevent hanging
             sent_message = await asyncio.wait_for(
                 discord_channel.send(formatted_content, embeds=embeds),
-                timeout=10.0  # 10 second timeout
+                timeout=10.0
             )
             
-            # Store mapping with thread safety
+            # Store in cache for reply detection
             if message.get('id'):
-                with mapping_lock:
-                    message_mapping[sent_message.id] = message['id']
                 with cache_lock:
                     reply_context_cache[message['id']] = {
                         **message,
@@ -1020,180 +337,84 @@ async def send_to_discord(message, reply_context=None):
                         'processed_timestamp': time.time()
                     }
             
-            update_health_stats(True)
+            with health_stats_lock:
+                health_stats["groupme_to_discord_sent"] += 1
+                health_stats["last_groupme_to_discord"] = time.time()
+            
             logger.info(f"✅ Message sent to Discord: {content[:50]}...")
             return True
             
         except asyncio.TimeoutError:
             logger.error("❌ Discord send timeout after 10 seconds")
-            update_health_stats(False)
-            return False
-        except discord.HTTPException as e:
-            logger.error(f"❌ Discord HTTP error: {e}")
-            update_health_stats(False)
-            return False
-        except discord.Forbidden as e:
-            logger.error(f"❌ Discord permission error: {e}")
-            update_health_stats(False)
             return False
         except Exception as e:
             logger.error(f"❌ Discord send error: {e}")
-            update_health_stats(False)
             return False
         
     except Exception as e:
         logger.error(f"❌ Failed to send to Discord: {e}")
-        update_health_stats(False)
         return False
 
-# Enhanced message queue processor
-async def message_queue_processor():
-    """Enhanced queue processor with duplicate protection"""
-    logger.info("📬 Starting enhanced message queue processor...")
-    
-    # Track processed messages to prevent duplicates
-    recently_processed = set()
+# ============================================================================
+# SIMPLE QUEUE PROCESSOR - ONLY FOR GROUPME->DISCORD
+# ============================================================================
+
+async def groupme_to_discord_processor():
+    """Process GroupMe->Discord messages from queue"""
+    logger.info("📬 Starting GroupMe->Discord queue processor...")
     
     while True:
         try:
-            with health_stats_lock:
-                health_stats["queue_size"] = message_queue.qsize()
+            msg_data = await groupme_to_discord_queue.get()
             
-            msg_data = await message_queue.get()
+            message = msg_data['message']
+            reply_context = msg_data.get('reply_context')
             
-            send_func = msg_data['send_func']
-            kwargs = msg_data['kwargs']
-            retries = msg_data.get('retries', 0)
-            msg_type = msg_data.get('type', 'unknown')
-            original_data = msg_data.get('original_data')
-            discord_message_id = msg_data.get('discord_message_id')
+            logger.info(f"📤 Processing queued GroupMe message from {message.get('name', 'Unknown')}")
             
-            # Create a unique processing ID for this specific message
-            if discord_message_id:
-                processing_id = f"{msg_type}:{discord_message_id}:{retries}"
-            else:
-                processing_id = f"{msg_type}:{hash(str(kwargs))}:{retries}"
+            success = await send_to_discord(message, reply_context)
             
-            # Check if we've recently processed this exact message
-            if processing_id in recently_processed:
-                logger.warning(f"🚫 BLOCKING: Already processed {processing_id}")
-                continue
-            
-            # Add to recently processed (with cleanup)
-            recently_processed.add(processing_id)
-            if len(recently_processed) > 100:
-                recently_processed.clear()
-            
-            logger.info(f"📤 Processing {msg_type} message (ID: {processing_id}, attempt {retries + 1}/{MAX_RETRIES})")
-            
-            # Double-check for duplicates at processing time
-            if original_data:
-                is_duplicate, reason = duplicate_detector.check_message_duplicate(
-                    original_data, "queue_processing"
-                )
-                if is_duplicate:
-                    logger.warning(f"🚫 Caught duplicate at processing stage: {reason}")
-                    duplicate_detector.mark_message_processed(original_data, "queue_processing")
-                    continue
-            
-            # Try to send the message
-            success = await send_func(**kwargs)
-            
-            if success:
-                logger.info(f"✅ Message sent successfully: {processing_id}")
-                if original_data:
-                    # Determine platform based on message type
-                    platform = "discord" if "discord" in msg_type else "groupme"
-                    duplicate_detector.mark_message_processed(original_data, platform)
-            elif retries < MAX_RETRIES - 1:
-                msg_data['retries'] = retries + 1
-                wait_time = RETRY_DELAY_BASE ** (retries + 1)
-                logger.warning(f"⏳ Message failed, retrying in {wait_time}s... ({processing_id})")
-                await asyncio.sleep(wait_time)
-                await message_queue.put(msg_data)
-            else:
-                with failed_messages_lock:
-                    failed_messages.append(msg_data)
-                logger.error(f"❌ Message failed after {MAX_RETRIES} attempts: {processing_id}")
-                if original_data:
-                    # Still mark as processed to prevent infinite retries
-                    platform = "discord" if "discord" in msg_type else "groupme"
-                    duplicate_detector.mark_message_processed(original_data, platform)
-                save_failed_messages()
+            if not success:
+                logger.error(f"❌ Failed to send queued message to Discord")
                 
         except Exception as e:
             logger.error(f"❌ Queue processor error: {e}")
             await asyncio.sleep(1)
 
-# Sync verification task
-async def sync_verification_task():
-    """Periodically verify message synchronization - LESS AGGRESSIVE"""
-    await asyncio.sleep(300)  # Wait 5 minutes after startup (increased)
-    
-    while True:
-        try:
-            await asyncio.sleep(SYNC_CHECK_INTERVAL)  # Now 1 hour instead of 10 minutes
-            logger.info("🔍 Running periodic sync verification (read-only)")
-            
-            # Run sync verification but don't auto-requeue to prevent triplets
-            report, missing_gm, missing_dc = await verify_message_sync()
-            
-            if report and (missing_gm or missing_dc):
-                logger.info(f"📊 Sync check complete: {len(missing_gm)} missing on GroupMe, {len(missing_dc)} missing on Discord")
-                logger.info("ℹ️ Use !syncfix to manually resync if needed (auto-requeue disabled)")
-            
-        except Exception as e:
-            logger.error(f"Sync verification task error: {e}")
+# ============================================================================
+# WEBHOOK SERVER
+# ============================================================================
 
-# Enhanced webhook server
 async def run_webhook_server():
-    """Enhanced webhook server with multi-layered duplicate protection"""
+    """Webhook server for receiving GroupMe messages"""
     
     async def health_check(request):
         with health_stats_lock:
             stats = health_stats.copy()
         
-        with sync_tracking_lock:
-            last_sync = sync_tracking.get('last_sync_check', 0)
-            sync_history = list(sync_tracking['verification_history'])
-        
-        dup_stats = duplicate_detector.get_stats()
-        
-        latest_sync_rate = "N/A"
-        if sync_history:
-            latest_sync_rate = f"{sync_history[-1]['sync_rate']:.1f}%"
+        with tracking_lock:
+            tracking_info = {
+                "discord_messages_tracked": len(processed_discord_ids),
+                "groupme_messages_tracked": len(processed_groupme_ids)
+            }
         
         return web.json_response({
             "status": "healthy",
             "bot_ready": bot_status["ready"],
             "uptime": time.time() - bot_status["start_time"],
-            "features": {
-                "robust_duplicate_detection": True,
-                "multi_layered_protection": True,
-                "message_queue": True,
-                "retry_logic": True,
-                "health_monitoring": True,
-                "persistence": True,
-                "thread_safety": True,
-                "sync_verification": True,
-                "discord_nicknames_only": True,
-                "discord_mention_conversion": True
-            },
             "health_stats": stats,
-            "duplicate_stats": dup_stats,
-            "reply_cache_size": len(reply_context_cache),
-            "failed_messages": len(failed_messages),
-            "sync_status": {
-                "latest_sync_rate": latest_sync_rate,
-                "last_check": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_sync)) if last_sync else "Never",
-                "auto_requeue_enabled": AUTO_REQUEUE_MISSING
+            "tracking": tracking_info,
+            "sync_verification": "DISABLED",
+            "features": {
+                "discord_to_groupme": "DIRECT (no queue)",
+                "groupme_to_discord": "QUEUED",
+                "duplicate_detection": "SIMPLE (ID only)",
+                "sync_verification": "DISABLED"
             }
         })
     
     async def groupme_webhook(request):
-        """SIMPLIFIED webhook handler with proper async context"""
-        start_time = time.time()
-        
+        """Handle incoming GroupMe messages"""
         try:
             data = await request.json()
             message_id = data.get('id')
@@ -1201,17 +422,28 @@ async def run_webhook_server():
             
             logger.info(f"📨 GroupMe webhook: {sender_info} - ID: {message_id}")
             
-            # BULLETPROOF duplicate check
-            if is_groupme_message_processed(str(message_id)):
-                logger.warning(f"🚫 DUPLICATE BLOCKED: GroupMe message {message_id} already processed")
-                return web.json_response({"status": "ignored", "reason": "already_processed"})
+            # Simple duplicate check
+            with tracking_lock:
+                if message_id in processed_groupme_ids:
+                    logger.warning(f"🚫 Duplicate GroupMe message blocked: {message_id}")
+                    with health_stats_lock:
+                        health_stats["duplicates_blocked"] += 1
+                    return web.json_response({"status": "ignored", "reason": "duplicate"})
+                processed_groupme_ids.add(message_id)
+                
+                # Keep set size manageable
+                if len(processed_groupme_ids) > 1000:
+                    # Remove oldest ~200 entries
+                    excess = list(processed_groupme_ids)[:200]
+                    for old_id in excess:
+                        processed_groupme_ids.discard(old_id)
             
             # Bot message filter
             if is_bot_message(data):
                 logger.info(f"🤖 Ignoring bot message from {data.get('name', 'Unknown')}")
                 return web.json_response({"status": "ignored", "reason": "bot_message"})
             
-            logger.info(f"✅ NEW GroupMe message: {message_id} from {data.get('name', 'Unknown')}")
+            logger.info(f"✅ Processing GroupMe message: {message_id}")
             
             # Store in recent messages
             if message_id:
@@ -1225,76 +457,37 @@ async def run_webhook_server():
                 with cache_lock:
                     reply_context_cache[message_id] = data
             
-            # Check if bot is ready with timeout
+            # Check if bot is ready
             if not bot.is_ready():
                 logger.warning("⏳ Bot not ready, waiting...")
-                ready = await wait_for_bot_ready(timeout=3)  # Reduced timeout
+                ready = await wait_for_bot_ready(timeout=3)
                 if not ready:
-                    logger.error("❌ Bot still not ready, queueing for later")
-                    # Queue for later processing instead of failing
-                    await message_queue.put({
-                        'send_func': send_to_discord,
-                        'kwargs': {'message': data, 'reply_context': None},
-                        'type': 'groupme_to_discord_delayed',
-                        'retries': 0,
-                        'original_data': data
-                    })
-                    return web.json_response({"status": "queued", "reason": "bot_not_ready"})
+                    logger.error("❌ Bot still not ready")
+                    return web.json_response({"status": "error", "reason": "bot_not_ready"})
             
-            # Detect reply context with timeout
+            # Detect reply context
             try:
                 reply_context = await asyncio.wait_for(
                     detect_reply_context(data),
-                    timeout=2.0  # 2 second timeout for reply detection
+                    timeout=2.0
                 )
             except asyncio.TimeoutError:
-                logger.warning("Reply context detection timed out, proceeding without")
+                logger.warning("Reply context detection timed out")
                 reply_context = None
             except Exception as e:
                 logger.warning(f"Reply context detection error: {e}")
                 reply_context = None
             
-            # Send directly to Discord with timeout protection
-            logger.info(f"📤 Sending GroupMe message {message_id} directly to Discord")
+            # Queue for processing
+            await groupme_to_discord_queue.put({
+                'message': data,
+                'reply_context': reply_context
+            })
             
-            try:
-                # Use asyncio.wait_for to prevent hanging
-                success = await asyncio.wait_for(
-                    send_to_discord(data, reply_context),
-                    timeout=15.0  # 15 second total timeout
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"❌ Discord send timeout for message {message_id}")
-                success = False
-            except Exception as e:
-                logger.error(f"❌ Discord send error for message {message_id}: {e}")
-                success = False
+            return web.json_response({"status": "queued"})
             
-            processing_time = time.time() - start_time
-            logger.info(f"⏱️ GroupMe webhook processed in {processing_time:.3f}s")
-            
-            if success:
-                logger.info(f"✅ Successfully sent GroupMe message {message_id} to Discord")
-                return web.json_response({"status": "success"})
-            else:
-                logger.error(f"❌ Failed to send GroupMe message {message_id} to Discord")
-                # Queue for retry instead of failing completely
-                await message_queue.put({
-                    'send_func': send_to_discord,
-                    'kwargs': {'message': data, 'reply_context': reply_context},
-                    'type': 'groupme_to_discord_retry',
-                    'retries': 0,
-                    'original_data': data
-                })
-                return web.json_response({"status": "queued_for_retry"})
-            
-        except asyncio.TimeoutError:
-            processing_time = time.time() - start_time
-            logger.error(f"❌ Webhook processing timeout ({processing_time:.3f}s)")
-            return web.json_response({"error": "Processing timeout"}, status=408)
         except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(f"❌ Error handling GroupMe webhook ({processing_time:.3f}s): {e}")
+            logger.error(f"❌ Error handling GroupMe webhook: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
     # Create web application
@@ -1309,7 +502,7 @@ async def run_webhook_server():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    logger.info(f"🌐 Enhanced webhook server running on 0.0.0.0:{PORT}")
+    logger.info(f"🌐 Webhook server running on 0.0.0.0:{PORT}")
     
     try:
         while True:
@@ -1333,7 +526,10 @@ def start_webhook_server():
     thread.start()
     return thread
 
-# Discord Bot Events
+# ============================================================================
+# DISCORD BOT EVENTS
+# ============================================================================
+
 @bot.event
 async def on_ready():
     """Bot ready event"""
@@ -1342,60 +538,18 @@ async def on_ready():
     
     logger.info(f'🤖 {bot.user} connected to Discord!')
     logger.info(f'📺 Channel ID: {DISCORD_CHANNEL_ID}')
-    logger.info(f'📬 Message queue: ✅ (for debug/retry only)')
-    logger.info(f'🔄 Retry logic: ✅')
-    logger.info(f'💾 Persistence: ✅')
-    logger.info(f'🔒 Thread safety: ✅')
-    logger.info(f'📊 Health monitoring: ✅')
-    logger.info(f'🛡️ SIMPLE duplicate detection: ✅ (complex detection available)')
-    logger.info(f'🔍 Sync verification: ✅ (every {SYNC_CHECK_INTERVAL//60} min)')
-    logger.info(f'🔄 Auto-requeue missing: {"✅" if AUTO_REQUEUE_MISSING else "❌ (DISABLED)"}')
-    logger.info(f'⚡ DIRECT MESSAGE FLOW: Normal messages bypass queue to prevent duplicates!')
+    logger.info(f'✅ FIXED: Discord->GroupMe is now DIRECT (no queue)')
+    logger.info(f'✅ FIXED: Sync verification DISABLED')
+    logger.info(f'✅ FIXED: Simple duplicate detection only')
     
-    # Start tasks
-    asyncio.create_task(message_queue_processor())
-    asyncio.create_task(sync_verification_task())
-    
-    # Load failed messages
-    failed = load_failed_messages()
-    if failed:
-        for msg in failed:
-            await message_queue.put(msg)
-        try:
-            os.remove(FAILED_MESSAGES_FILE)
-        except:
-            pass
-
-# BULLETPROOF Discord message tracking - MUCH simpler
-discord_message_lock = threading.Lock()
-processed_discord_ids = set()
-
-def track_discord_message(message_id: str) -> bool:
-    """
-    Track Discord message ID - return True if it's a duplicate
-    This is the ONLY place that should track Discord messages
-    """
-    with discord_message_lock:
-        if message_id in processed_discord_ids:
-            logger.warning(f"🚫 DUPLICATE Discord message blocked: {message_id}")
-            return True
-        
-        processed_discord_ids.add(message_id)
-        
-        # Keep only last 500 messages to prevent memory issues
-        if len(processed_discord_ids) > 500:
-            # Remove oldest 100 messages
-            old_ids = list(processed_discord_ids)[:100]
-            processed_discord_ids.difference_update(old_ids)
-        
-        logger.info(f"✅ NEW Discord message tracked: {message_id}")
-        return False
+    # Start the GroupMe->Discord processor
+    asyncio.create_task(groupme_to_discord_processor())
 
 @bot.event
 async def on_message(message):
-    """ULTRA-SIMPLE Discord message handler - no complex logic"""
+    """Handle Discord messages - ULTRA SIMPLE"""
     try:
-        # Basic filters - return early for anything we don't want
+        # Basic filters
         if message.author.bot:
             await bot.process_commands(message)
             return
@@ -1410,16 +564,27 @@ async def on_message(message):
         
         message_id = str(message.id)
         
-        # SINGLE point of duplicate detection - if duplicate, STOP HERE
-        if track_discord_message(message_id):
-            await bot.process_commands(message)
-            return
+        # Simple duplicate check
+        with tracking_lock:
+            if message_id in processed_discord_ids:
+                logger.warning(f"🚫 Duplicate Discord message blocked: {message_id}")
+                with health_stats_lock:
+                    health_stats["duplicates_blocked"] += 1
+                await bot.process_commands(message)
+                return
+            processed_discord_ids.add(message_id)
+            
+            # Keep set size manageable
+            if len(processed_discord_ids) > 1000:
+                excess = list(processed_discord_ids)[:200]
+                for old_id in excess:
+                    processed_discord_ids.discard(old_id)
         
-        # Get basic info
+        # Get message info
         discord_nickname = message.author.display_name
         message_content = message.content or ""
         
-        # Handle attachments simply
+        # Handle attachments
         if message.attachments:
             if message_content:
                 message_content += " [Attachment]"
@@ -1445,7 +610,7 @@ async def on_message(message):
             except:
                 pass
         
-        # Store in recent messages (for other functions)
+        # Store in recent messages (for reply detection from GroupMe)
         with discord_messages_lock:
             recent_discord_messages.append({
                 'content': message.content,
@@ -1456,8 +621,8 @@ async def on_message(message):
                 'message_id': message.id
             })
         
-        # Send DIRECTLY to GroupMe - NO complex logic, NO queues, NO additional checks
-        logger.info(f"📤 Sending Discord message {message_id} directly to GroupMe: {message_content[:50]}...")
+        # Send DIRECTLY to GroupMe - NO QUEUE, NO COMPLEX LOGIC
+        logger.info(f"📤 Sending Discord message {message_id} directly to GroupMe")
         
         success = await send_to_groupme(
             text=message_content,
@@ -1466,9 +631,9 @@ async def on_message(message):
         )
         
         if success:
-            logger.info(f"✅ Discord message {message_id} sent to GroupMe successfully")
+            logger.info(f"✅ Discord->GroupMe success for message {message_id}")
         else:
-            logger.error(f"❌ Discord message {message_id} failed to send to GroupMe")
+            logger.error(f"❌ Discord->GroupMe failed for message {message_id}")
         
         await bot.process_commands(message)
         
@@ -1490,852 +655,156 @@ async def on_reaction_add(reaction, user):
     original_content = reaction.message.content[:50] if reaction.message.content else "a message"
     reaction_text = f"{discord_nickname} reacted {emoji} to '{original_content}...'"
     
-    reaction_data = {
-        'text': reaction_text,
-        'name': discord_nickname,
-        'user_id': str(user.id),
-        'id': f"reaction_{reaction.message.id}_{user.id}_{emoji}",
-        'timestamp': time.time()
-    }
-    
-    is_duplicate, reason = duplicate_detector.check_message_duplicate(reaction_data, "discord_reaction")
-    if not is_duplicate and not duplicate_detector.check_queue_duplicate(reaction_data):
-        await message_queue.put({
-            'send_func': send_to_groupme,
-            'kwargs': {
-                'text': reaction_text,
-                'author_name': discord_nickname
-            },
-            'type': 'discord_reaction',
-            'retries': 0,
-            'original_data': reaction_data
-        })
+    # Send directly to GroupMe
+    await send_to_groupme(
+        text=reaction_text,
+        author_name=discord_nickname
+    )
 
-# Health monitoring task
-async def health_monitor():
-    """Monitor bridge health and log statistics"""
-    while True:
-        try:
-            await asyncio.sleep(300)  # Every 5 minutes
-            
-            with health_stats_lock:
-                stats = health_stats.copy()
-            
-            dup_stats = duplicate_detector.get_stats()
-            
-            total_messages = stats["messages_sent"] + stats["messages_failed"]
-            if total_messages > 0:
-                success_rate = (stats["messages_sent"] / total_messages) * 100
-            else:
-                success_rate = 100
-            
-            logger.info("📊 BRIDGE HEALTH REPORT:")
-            logger.info(f"✅ Messages sent: {stats['messages_sent']}")
-            logger.info(f"❌ Messages failed: {stats['messages_failed']}")
-            logger.info(f"📈 Success rate: {success_rate:.1f}%")
-            logger.info(f"📬 Queue size: {stats['queue_size']}")
-            logger.info(f"💾 Failed messages: {len(failed_messages)}")
-            logger.info(f"⏰ Last success: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats['last_success']))}")
-            
-            logger.info("🛡️ DUPLICATE DETECTION STATS:")
-            logger.info(f"📊 Total checked: {dup_stats['total_checked']}")
-            logger.info(f"🚫 Duplicates blocked: {dup_stats['duplicates_blocked']} ({dup_stats['duplicate_rate']:.1f}%)")
-            logger.info(f"🔗 ID duplicates: {dup_stats['id_duplicates']}")
-            logger.info(f"📝 Content duplicates: {dup_stats['content_duplicates']}")
-            logger.info(f"⏱️ Rate limited: {dup_stats['rate_limited']}")
-            logger.info(f"🌐 Webhook duplicates: {dup_stats['webhook_duplicates']}")
-            logger.info(f"📬 Queue duplicates: {dup_stats['queue_duplicates']}")
-            logger.info(f"⚡ System overloaded: {'YES' if dup_stats['system_overloaded'] else 'NO'}")
-            logger.info(f"🔓 Temporarily disabled: {'YES' if dup_stats['temporarily_disabled'] else 'NO'}")
-            
-            if success_rate < 90 and total_messages > 10:
-                logger.warning(f"⚠️ High failure rate detected: {100-success_rate:.1f}%")
-            
-            if dup_stats["duplicate_rate"] > 20 and dup_stats["total_checked"] > 50:
-                logger.warning(f"⚠️ High duplicate rate detected: {dup_stats['duplicate_rate']:.1f}%")
-            
-            save_failed_messages()
-            
-        except Exception as e:
-            logger.error(f"Health monitor error: {e}")
+# ============================================================================
+# BOT COMMANDS
+# ============================================================================
 
-# Enhanced cleanup task
-async def enhanced_cleanup():
-    """Enhanced cleanup with persistence"""
-    while True:
-        try:
-            await asyncio.sleep(3600)  # Every hour
-            
-            with mapping_lock:
-                if len(message_mapping) > 500:
-                    old_keys = list(message_mapping.keys())[:-500]
-                    for key in old_keys:
-                        message_mapping.pop(key, None)
-            
-            with cache_lock:
-                if len(reply_context_cache) > 200:
-                    old_keys = list(reply_context_cache.keys())[:-200]
-                    for key in old_keys:
-                        reply_context_cache.pop(key, None)
-            
-            save_failed_messages()
-            logger.info("🧹 Cleanup completed")
-            
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-
-# Bot Commands
 @bot.command(name='status')
 async def status(ctx):
-    """Enhanced status command"""
+    """Bridge status command"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
     with health_stats_lock:
         stats = health_stats.copy()
     
-    with sync_tracking_lock:
-        last_sync = sync_tracking.get('last_sync_check', 0)
-        sync_history = list(sync_tracking['verification_history'])
+    with tracking_lock:
+        discord_tracked = len(processed_discord_ids)
+        groupme_tracked = len(processed_groupme_ids)
     
-    dup_stats = duplicate_detector.get_stats()
-    
-    total_messages = stats["messages_sent"] + stats["messages_failed"]
-    success_rate = (stats["messages_sent"] / total_messages * 100) if total_messages > 0 else 100
-    
-    latest_sync_rate = "N/A"
-    if sync_history:
-        latest_sync_rate = f"{sync_history[-1]['sync_rate']:.1f}%"
-    
-    status_msg = f"""🟢 **Enhanced Bridge Status**
+    status_msg = f"""🟢 **Bridge Status (FIXED)**
 🔗 GroupMe Bot: {'✅' if GROUPME_BOT_ID else '❌'}
 🔑 Access Token: {'✅' if GROUPME_ACCESS_TOKEN else '❌'}
 🌐 Webhook Server: ✅
 
-**📊 Health Statistics:**
-✅ Messages sent: {stats["messages_sent"]}
-❌ Messages failed: {stats["messages_failed"]}
-📈 Success rate: {success_rate:.1f}%
-📬 Queue size: {stats["queue_size"]}
-💾 Failed messages: {len(failed_messages)}
+**📊 Message Statistics:**
+Discord→GroupMe sent: {stats["discord_to_groupme_sent"]}
+GroupMe→Discord sent: {stats["groupme_to_discord_sent"]}
+Duplicates blocked: {stats["duplicates_blocked"]}
 
-**🛡️ Duplicate Detection:**
-📊 Total checked: {dup_stats["total_checked"]}
-🚫 Duplicates blocked: {dup_stats["duplicates_blocked"]} ({dup_stats["duplicate_rate"]:.1f}%)
-⚡ System status: {"Overloaded" if dup_stats["system_overloaded"] else "Normal"}
-🔓 Temporarily disabled: {"YES" if dup_stats["temporarily_disabled"] else "NO"}
+**🔍 Tracking:**
+Discord messages: {discord_tracked}
+GroupMe messages: {groupme_tracked}
 
-**🔄 Sync Verification:**
-📊 Latest sync rate: {latest_sync_rate}
-⏰ Last check: {time.strftime('%H:%M:%S', time.localtime(last_sync)) if last_sync else 'Never'}
-🔍 Next check: {time.strftime('%H:%M:%S', time.localtime(last_sync + SYNC_CHECK_INTERVAL)) if last_sync else 'Soon'}
-🔄 Auto-requeue: {"✅" if AUTO_REQUEUE_MISSING else "❌"}
+**✅ FIXES APPLIED:**
+• Discord→GroupMe: DIRECT (no queue)
+• Sync verification: DISABLED
+• Duplicate detection: SIMPLE (ID only)
+• Message queue: REMOVED for Discord→GroupMe
 
-**🔧 Enhanced Features:**
-📬 Message Queue: ✅
-🔄 Retry Logic: ✅ (max {MAX_RETRIES} attempts)
-💾 Persistence: ✅
-🔒 Thread Safety: ✅
-📊 Health Monitoring: ✅
-🛡️ Robust Duplicate Detection: ✅
-🔍 Sync Verification: ✅
-🏷️ Discord Nicknames: ✅
-🔗 Mention Conversion: ✅
-
-📝 Message Mappings: {len(message_mapping)}
-🔗 Reply Cache: {len(reply_context_cache)}"""
+**⏰ Last Activity:**
+Discord→GroupMe: {time.strftime('%H:%M:%S', time.localtime(stats['last_discord_to_groupme'])) if stats['last_discord_to_groupme'] else 'Never'}
+GroupMe→Discord: {time.strftime('%H:%M:%S', time.localtime(stats['last_groupme_to_discord'])) if stats['last_groupme_to_discord'] else 'Never'}"""
     
     await ctx.send(status_msg)
 
-@bot.command(name='duplicates')
-async def duplicate_stats(ctx):
-    """Show detailed duplicate detection statistics"""
+@bot.command(name='reset_tracking')
+async def reset_tracking(ctx):
+    """Reset message tracking"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    stats = duplicate_detector.get_stats()
-    
-    embed = discord.Embed(
-        title="🛡️ Duplicate Detection Statistics",
-        color=discord.Color.blue() if not stats["system_overloaded"] else discord.Color.orange()
-    )
-    
-    embed.add_field(name="📊 Total Checked", value=stats['total_checked'], inline=True)
-    embed.add_field(name="🚫 Duplicates Blocked", value=stats['duplicates_blocked'], inline=True)
-    embed.add_field(name="📈 Block Rate", value=f"{stats['duplicate_rate']:.1f}%", inline=True)
-    
-    embed.add_field(name="🆔 ID Duplicates", value=stats['id_duplicates'], inline=True)
-    embed.add_field(name="📝 Content Duplicates", value=stats['content_duplicates'], inline=True)
-    embed.add_field(name="⏱️ Rate Limited", value=stats['rate_limited'], inline=True)
-    
-    embed.add_field(name="🌐 Webhook Duplicates", value=stats['webhook_duplicates'], inline=True)
-    embed.add_field(name="📬 Queue Duplicates", value=stats['queue_duplicates'], inline=True)
-    embed.add_field(name="⚡ System Status", value="Overloaded" if stats['system_overloaded'] else "Normal", inline=True)
-    
-    embed.add_field(name="🔓 Disabled", value="YES" if stats['temporarily_disabled'] else "NO", inline=True)
-    
-    embed.add_field(name="💾 Tracking Data", 
-                   value=f"IDs: {stats['processed_ids_count']}\nContent: {stats['content_hashes_count']}\nQueue: {stats['queued_hashes_count']}\nWebhook: {stats['webhook_requests_count']}", 
-                   inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='fix_async')
-async def fix_async_context(ctx):
-    """Try to fix async context issues"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    await ctx.send("🔧 Attempting to fix async context issues...")
-    
-    # Test basic async operations
-    try:
-        # Test aiohttp
-        test_url = "https://httpbin.org/get"
-        response = await make_http_request(test_url)
-        if response['status'] == 200:
-            await ctx.send("✅ HTTP requests working")
-        else:
-            await ctx.send(f"⚠️ HTTP test returned status {response['status']}")
-    except Exception as e:
-        await ctx.send(f"❌ HTTP test failed: {e}")
-    
-    # Test Discord operations
-    try:
-        test_embed = discord.Embed(title="Test Embed", description="Testing Discord operations")
-        await ctx.send("✅ Discord operations working", embed=test_embed)
-    except Exception as e:
-        await ctx.send(f"❌ Discord test failed: {e}")
-    
-    await ctx.send("🔧 Async context test complete. Check logs for any remaining issues.")
-
-@bot.command(name='sync')
-async def check_sync(ctx):
-    """Manually run sync verification"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    await ctx.send("🔍 Running sync verification...")
-    
-    report, missing_gm, missing_dc = await verify_message_sync()
-    
-    if report:
-        embed = discord.Embed(
-            title="🔄 Sync Verification Report",
-            color=discord.Color.green() if report['sync_rate'] > 95 else discord.Color.orange()
-        )
+    with tracking_lock:
+        discord_count = len(processed_discord_ids)
+        groupme_count = len(processed_groupme_ids)
         
-        embed.add_field(name="📊 Sync Rate", value=f"{report['sync_rate']:.1f}%", inline=True)
-        embed.add_field(name="💬 Discord Messages", value=report['discord_total'], inline=True)
-        embed.add_field(name="💬 GroupMe Messages", value=report['groupme_total'], inline=True)
-        
-        if report['missing_on_groupme'] > 0:
-            embed.add_field(name="⚠️ Missing on GroupMe", value=report['missing_on_groupme'], inline=True)
-        if report['missing_on_discord'] > 0:
-            embed.add_field(name="⚠️ Missing on Discord", value=report['missing_on_discord'], inline=True)
-        
-        status_emoji = "✅" if report['sync_rate'] > 95 else "⚠️"
-        embed.add_field(
-            name=f"{status_emoji} Status", 
-            value="All messages synced!" if report['sync_rate'] == 100 else "Some messages missing",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="🔄 Auto-requeue",
-            value="✅ Enabled" if AUTO_REQUEUE_MISSING else "❌ Disabled (use !syncfix)",
-            inline=False
-        )
-        
-        await ctx.send(embed=embed)
-    else:
-        await ctx.send("❌ Failed to run sync verification")
-
-@bot.command(name='syncfix')
-async def sync_fix(ctx):
-    """Run sync verification and re-send missing messages"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
+        processed_discord_ids.clear()
+        processed_groupme_ids.clear()
     
-    await ctx.send("🔍 Running sync verification with manual fix...")
-    
-    report, missing_gm, missing_dc = await verify_message_sync()
-    
-    if report:
-        total_missing = len(missing_gm) + len(missing_dc)
-        
-        if total_missing == 0:
-            await ctx.send("✅ All messages are properly synced!")
-            return
-        
-        embed = discord.Embed(
-            title="🔍 Sync Check Results",
-            color=discord.Color.orange()
-        )
-        embed.add_field(name="📊 Sync Rate", value=f"{report['sync_rate']:.1f}%", inline=True)
-        embed.add_field(name="⚠️ Missing on GroupMe", value=len(missing_gm), inline=True)
-        embed.add_field(name="⚠️ Missing on Discord", value=len(missing_dc), inline=True)
-        
-        if missing_gm:
-            sample_gm = missing_gm[:3]
-            gm_list = "\n".join([f"- {msg['author']}: {msg['content'][:30]}..." for msg in sample_gm])
-            embed.add_field(name="Sample Missing on GroupMe", value=gm_list, inline=False)
-        
-        if missing_dc:
-            sample_dc = missing_dc[:3]
-            dc_list = "\n".join([f"- {msg['author']}: {msg['content'][:30]}..." for msg in sample_dc])
-            embed.add_field(name="Sample Missing on Discord", value=dc_list, inline=False)
-        
-        await ctx.send(embed=embed)
-        
-        if total_missing <= 5:
-            await ctx.send(f"Would you like to resync these {total_missing} messages? React with ✅ to proceed or ❌ to cancel.")
-            
-            logger.info(f"Manual sync fix requested for {total_missing} messages")
-            
-            # Only resync very recent messages that are clearly missing
-            recent_missing_gm = [msg for msg in missing_gm if time.time() - msg['timestamp'] > 60 and time.time() - msg['timestamp'] < 300]
-            recent_missing_dc = [msg for msg in missing_dc if time.time() - msg['timestamp'] > 60 and time.time() - msg['timestamp'] < 300]
-            
-            if recent_missing_gm or recent_missing_dc:
-                await resync_missing_messages(recent_missing_gm, recent_missing_dc)
-                await ctx.send(f"🔄 Resynced {len(recent_missing_gm)} to GroupMe and {len(recent_missing_dc)} to Discord")
-            else:
-                await ctx.send("ℹ️ No recent messages needed resyncing (messages were too old or too new)")
-        else:
-            await ctx.send(f"⚠️ Too many missing messages ({total_missing}). Check logs and use !clear_cache if needed.")
-    else:
-        await ctx.send("❌ Failed to run sync verification")
-
-@bot.command(name='synchistory')
-async def sync_history(ctx):
-    """Show sync verification history"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    with sync_tracking_lock:
-        history = list(sync_tracking['verification_history'])
-    
-    if not history:
-        await ctx.send("📊 No sync verification history available yet")
-        return
-    
-    embed = discord.Embed(
-        title="📈 Sync Verification History",
-        description=f"Last {len(history)} sync checks",
-        color=discord.Color.blue()
-    )
-    
-    avg_sync_rate = sum(h['sync_rate'] for h in history) / len(history)
-    embed.add_field(name="📊 Average Sync Rate", value=f"{avg_sync_rate:.1f}%", inline=False)
-    
-    for i, check in enumerate(reversed(history[-5:])):
-        time_str = time.strftime('%H:%M', time.localtime(check['timestamp']))
-        status = "✅" if check['sync_rate'] > 95 else "⚠️"
-        
-        embed.add_field(
-            name=f"{status} {time_str}",
-            value=f"Rate: {check['sync_rate']:.1f}% | Missing: {check['missing_on_groupme'] + check['missing_on_discord']}",
-            inline=True
-        )
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='retry')
-async def retry_failed(ctx):
-    """Retry all failed messages"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    with failed_messages_lock:
-        count = len(failed_messages)
-        if count == 0:
-            await ctx.send("✅ No failed messages to retry")
-            return
-        
-        for msg in list(failed_messages):
-            msg['retries'] = 0
-            await message_queue.put(msg)
-        
-        failed_messages.clear()
-    
-    await ctx.send(f"🔄 Queued {count} failed messages for retry")
+    await ctx.send(f"🧹 Tracking reset!\nCleared {discord_count} Discord and {groupme_count} GroupMe message IDs")
 
 @bot.command(name='health')
 async def health_report(ctx):
-    """Detailed health report"""
+    """Health report"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
     with health_stats_lock:
         stats = health_stats.copy()
     
-    dup_stats = duplicate_detector.get_stats()
-    
     embed = discord.Embed(
         title="🏥 Bridge Health Report",
-        color=discord.Color.green() if stats["messages_failed"] < stats["messages_sent"] * 0.1 else discord.Color.orange()
-    )
-    
-    total = stats["messages_sent"] + stats["messages_failed"]
-    success_rate = (stats["messages_sent"] / total * 100) if total > 0 else 100
-    
-    embed.add_field(name="✅ Success Rate", value=f"{success_rate:.1f}%", inline=True)
-    embed.add_field(name="📬 Queue Size", value=stats["queue_size"], inline=True)
-    embed.add_field(name="💾 Failed Messages", value=len(failed_messages), inline=True)
-    
-    embed.add_field(name="🛡️ Duplicate Rate", value=f"{dup_stats['duplicate_rate']:.1f}%", inline=True)
-    embed.add_field(name="⚡ System Status", value="Overloaded" if dup_stats['system_overloaded'] else "Normal", inline=True)
-    embed.add_field(name="🔓 Dup Detection", value="Disabled" if dup_stats['temporarily_disabled'] else "Enabled", inline=True)
-    
-    if stats["last_failure"]:
-        last_fail = time.strftime('%H:%M:%S', time.localtime(stats["last_failure"]))
-        embed.add_field(name="❌ Last Failure", value=last_fail, inline=True)
-    
-    embed.add_field(name="📊 Total Processed", value=f"{total} messages", inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='resetstats')
-async def reset_stats(ctx):
-    """Reset duplicate detection statistics"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    duplicate_detector.reset_stats()
-    await ctx.send("📊 Duplicate detection statistics have been reset")
-
-@bot.command(name='disable_dup')
-async def disable_duplicates(ctx, seconds: int = 60):
-    """Temporarily disable duplicate detection for debugging"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    if seconds > 300:
-        seconds = 300
-    
-    duplicate_detector.temporarily_disable(seconds)
-    await ctx.send(f"🔓 Duplicate detection disabled for {seconds} seconds")
-
-@bot.command(name='clear_cache')
-async def clear_cache(ctx):
-    """Clear duplicate detection cache"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    old_counts = duplicate_detector.reset_all_caches()
-    total_cleared = sum(old_counts.values())
-    
-    await ctx.send(f"🧹 Duplicate detection cache cleared!\n"
-                  f"Removed: {total_cleared} total entries\n"
-                  f"Details: {old_counts}")
-
-@bot.command(name='debug_dup')
-async def debug_duplicates(ctx):
-    """Show current duplicate detection state"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    stats = duplicate_detector.get_stats()
-    
-    embed = discord.Embed(
-        title="🔍 Duplicate Detection Debug Info",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(name="📊 Current Tracking", 
-                   value=f"Message IDs: {stats['processed_ids_count']}\n"
-                         f"Content Hashes: {stats['content_hashes_count']}\n"
-                         f"Queue Hashes: {stats['queued_hashes_count']}\n"
-                         f"Webhook Requests: {stats['webhook_requests_count']}", 
-                   inline=True)
-    
-    embed.add_field(name="🚫 Block Counts",
-                   value=f"ID Duplicates: {stats['id_duplicates']}\n"
-                         f"Content Duplicates: {stats['content_duplicates']}\n"
-                         f"Rate Limited: {stats['rate_limited']}\n"
-                         f"Webhook Duplicates: {stats['webhook_duplicates']}", 
-                   inline=True)
-    
-    embed.add_field(name="⚡ Status",
-                   value=f"Disabled: {'YES' if stats['temporarily_disabled'] else 'NO'}\n"
-                         f"Overloaded: {'YES' if stats['system_overloaded'] else 'NO'}\n"
-                         f"Block Rate: {stats['duplicate_rate']:.1f}%", 
-                   inline=True)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='debug_msg')
-async def debug_message(ctx):
-    """Send a test message to check flow"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    test_msg = f"Debug test message at {time.strftime('%H:%M:%S')}"
-    await ctx.send(f"Sending test message: {test_msg}")
-    
-    await message_queue.put({
-        'send_func': send_to_groupme,
-        'kwargs': {
-            'text': test_msg,
-            'author_name': 'DEBUG'
-        },
-        'type': 'debug_test',
-        'retries': 0
-    })
-
-@bot.command(name='force_msg')
-async def force_message(ctx, *, message_text):
-    """Force send a message bypassing duplicate detection"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    # Temporarily disable duplicate detection
-    duplicate_detector.temporarily_disable(10)
-    
-    await ctx.send(f"🔓 Force sending: {message_text}")
-    
-    await message_queue.put({
-        'send_func': send_to_groupme,
-        'kwargs': {
-            'text': f"FORCE: {message_text}",
-            'author_name': ctx.author.display_name
-        },
-        'type': 'force_test',
-        'retries': 0
-    })
-
-@bot.command(name='queue_info')
-async def queue_info(ctx):
-    """Show current queue status and recent activity"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    with health_stats_lock:
-        queue_size = health_stats["queue_size"]
-    
-    dup_stats = duplicate_detector.get_stats()
-    
-    embed = discord.Embed(
-        title="📬 Queue Information",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(name="📊 Current Status", 
-                   value=f"Queue Size: {queue_size}\n"
-                         f"Messages Sent: {health_stats['messages_sent']}\n"
-                         f"Messages Failed: {health_stats['messages_failed']}", 
-                   inline=True)
-    
-    embed.add_field(name="🛡️ Duplicate Protection",
-                   value=f"Queue Duplicates Blocked: {dup_stats['queue_duplicates']}\n"
-                         f"ID Duplicates Blocked: {dup_stats['id_duplicates']}\n"
-                         f"Total Checked: {dup_stats['total_checked']}", 
-                   inline=True)
-    
-    embed.add_field(name="🔍 Recent Discord Messages",
-                   value=f"Tracked: {len(recent_discord_messages)}\n"
-                         f"Last: {recent_discord_messages[-1]['author'] if recent_discord_messages else 'None'}", 
-                   inline=True)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='reset_simple')
-async def reset_simple_tracking(ctx):
-    """Reset the simple duplicate tracking"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    with message_processing_lock:
-        discord_count = len(processed_discord_messages)
-        groupme_count = len(processed_groupme_messages)
-        
-        processed_discord_messages.clear()
-        processed_groupme_messages.clear()
-    
-    await ctx.send(f"🧹 Simple tracking reset!\n"
-                  f"Cleared {discord_count} Discord messages and {groupme_count} GroupMe messages")
-
-@bot.command(name='simple_status')
-async def simple_status(ctx):
-    """Show simple duplicate tracking status"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    with message_processing_lock:
-        discord_count = len(processed_discord_messages)
-        groupme_count = len(processed_groupme_messages)
-    
-    embed = discord.Embed(
-        title="🔍 Simple Duplicate Tracking",
         color=discord.Color.green()
     )
     
-    embed.add_field(name="📊 Tracked Messages", 
-                   value=f"Discord: {discord_count}\nGroupMe: {groupme_count}", 
-                   inline=True)
+    total_sent = stats["discord_to_groupme_sent"] + stats["groupme_to_discord_sent"]
     
-    # Show last few Discord messages tracked
-    with message_processing_lock:
-        recent_discord = list(processed_discord_messages)[-5:] if processed_discord_messages else []
-        recent_groupme = list(processed_groupme_messages)[-5:] if processed_groupme_messages else []
+    embed.add_field(name="📤 Total Messages", value=total_sent, inline=True)
+    embed.add_field(name="🚫 Duplicates Blocked", value=stats["duplicates_blocked"], inline=True)
     
-    if recent_discord:
-        embed.add_field(name="🎮 Recent Discord IDs", 
-                       value="\n".join(recent_discord), 
-                       inline=True)
+    if total_sent > 0:
+        duplicate_rate = (stats["duplicates_blocked"] / (total_sent + stats["duplicates_blocked"])) * 100
+        embed.add_field(name="📊 Duplicate Rate", value=f"{duplicate_rate:.1f}%", inline=True)
     
-    if recent_groupme:
-        embed.add_field(name="💬 Recent GroupMe IDs", 
-                       value="\n".join(recent_groupme), 
-                       inline=True)
+    embed.add_field(name="Discord→GroupMe", value=stats["discord_to_groupme_sent"], inline=True)
+    embed.add_field(name="GroupMe→Discord", value=stats["groupme_to_discord_sent"], inline=True)
     
     await ctx.send(embed=embed)
 
-@bot.command(name='test_simple_discord')
-async def test_simple_discord(ctx):
-    """Test sending a message directly to GroupMe (bypasses normal flow)"""
+@bot.command(name='test_discord_send')
+async def test_discord_send(ctx):
+    """Test sending a message to GroupMe"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
     test_time = time.strftime('%H:%M:%S')
-    test_msg = f"Direct test to GroupMe at {test_time}"
+    test_msg = f"Test message to GroupMe at {test_time}"
     
-    await ctx.send(f"🧪 Sending direct test: {test_msg}")
+    await ctx.send(f"🧪 Sending test: {test_msg}")
     
-    # Send directly to GroupMe
     success = await send_to_groupme(
         text=test_msg,
-        author_name="DIRECT_TEST"
+        author_name="TEST"
     )
     
     if success:
-        await ctx.send("✅ Direct send successful - check GroupMe for exactly ONE message")
+        await ctx.send("✅ Test successful - check GroupMe for EXACTLY ONE message")
     else:
-        await ctx.send("❌ Direct send failed")
+        await ctx.send("❌ Test failed")
 
-@bot.command(name='test_discord_send')
-async def test_discord_send(ctx):
-    """Test sending a message to Discord (internal test)"""
+@bot.command(name='clear_cache')
+async def clear_cache(ctx):
+    """Clear all caches"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    await ctx.send("🧪 Testing Discord send function...")
+    with cache_lock:
+        cache_size = len(reply_context_cache)
+        reply_context_cache.clear()
     
-    # Create a fake GroupMe message to test the send_to_discord function
-    test_message = {
-        'id': f'test_{int(time.time())}',
-        'text': f'Test message from GroupMe at {time.strftime("%H:%M:%S")}',
-        'name': 'TEST_USER',
-        'attachments': []
-    }
+    with discord_messages_lock:
+        discord_size = len(recent_discord_messages)
+        recent_discord_messages.clear()
     
-    try:
-        success = await send_to_discord(test_message)
-        if success:
-            await ctx.send("✅ Discord send function working correctly!")
-        else:
-            await ctx.send("❌ Discord send function failed!")
-    except Exception as e:
-        await ctx.send(f"❌ Discord send function error: {e}")
-
-@bot.command(name='bot_status')
-async def bot_status_check(ctx):
-    """Check bot connection status"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
+    with groupme_messages_lock:
+        groupme_size = len(recent_groupme_messages)
+        recent_groupme_messages.clear()
     
-    embed = discord.Embed(
-        title="🤖 Bot Status Check",
-        color=discord.Color.green() if bot.is_ready() else discord.Color.red()
-    )
-    
-    embed.add_field(name="Bot Ready", value="✅ Yes" if bot.is_ready() else "❌ No", inline=True)
-    embed.add_field(name="Bot User", value=str(bot.user) if bot.user else "None", inline=True)
-    embed.add_field(name="Latency", value=f"{bot.latency*1000:.1f}ms", inline=True)
-    
-    embed.add_field(name="Channel Access", value="✅ Yes" if ctx.channel else "❌ No", inline=True)
-    embed.add_field(name="Channel ID", value=str(DISCORD_CHANNEL_ID), inline=True)
-    embed.add_field(name="Guild", value=str(ctx.guild.name) if ctx.guild else "DM", inline=True)
-    
-    try:
-        # Test sending a simple message
-        test_start = time.time()
-        test_msg = await ctx.send("Testing message send speed...")
-        test_time = time.time() - test_start
-        await test_msg.edit(content=f"✅ Message send test: {test_time:.3f}s")
-        embed.add_field(name="Send Test", value=f"✅ {test_time:.3f}s", inline=True)
-    except Exception as e:
-        embed.add_field(name="Send Test", value=f"❌ {str(e)}", inline=True)
-    
-    await ctx.send(embed=embed)
-
-@bot.command(name='disable_complex')
-async def disable_complex_detection(ctx):
-    """Disable the complex duplicate detector entirely"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    # Disable for a long time
-    duplicate_detector.temporarily_disable(3600)  # 1 hour
-    
-    await ctx.send("🔓 Complex duplicate detection disabled for 1 hour.\n"
-                  "Only simple ID tracking is now active.")
+    await ctx.send(f"🧹 Caches cleared!\nReply cache: {cache_size}\nRecent Discord: {discord_size}\nRecent GroupMe: {groupme_size}")
 
 @bot.command(name='queue_status')
 async def queue_status(ctx):
-    """Show queue status - should be mostly empty now"""
+    """Show queue status"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    with health_stats_lock:
-        queue_size = health_stats["queue_size"]
+    queue_size = groupme_to_discord_queue.qsize()
     
-    await ctx.send(f"📬 Message queue size: {queue_size}\n"
-                  f"Note: Normal messages now bypass the queue to prevent duplicates.\n"
-                  f"Queue is only used for retries and special functions.")
+    await ctx.send(f"📬 GroupMe→Discord queue size: {queue_size}\n"
+                  f"Note: Discord→GroupMe messages are sent DIRECTLY (no queue)")
 
-@bot.command(name='emergency_reset')
-async def emergency_reset(ctx):
-    """Emergency reset of all systems"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    await ctx.send("🚨 EMERGENCY RESET - Clearing all caches and state...")
-    
-    # Reset simple tracking
-    with message_processing_lock:
-        processed_discord_messages.clear()
-        processed_groupme_messages.clear()
-    
-    # Reset complex detection
-    duplicate_detector.reset_all_caches()
-    
-    # Clear message queues
-    try:
-        while not message_queue.empty():
-            message_queue.get_nowait()
-    except:
-        pass
-    
-    # Clear recent messages
-    with discord_messages_lock:
-        recent_discord_messages.clear()
-    with groupme_messages_lock:
-        recent_groupme_messages.clear()
-    
-    # Clear caches
-    with cache_lock:
-        reply_context_cache.clear()
-    with mapping_lock:
-        message_mapping.clear()
-    
-    await ctx.send("✅ Emergency reset complete! All systems cleared.")
-    await ctx.send("Try sending a test message now.")
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
 
-@bot.command(name='test_groupme_send')
-async def test_groupme_send(ctx):
-    """Test sending a message to GroupMe (internal test)"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    await ctx.send("🧪 Testing GroupMe send function...")
-    
-    test_message = f'Test message from Discord at {time.strftime("%H:%M:%S")}'
-    
-    try:
-        success = await send_to_groupme(
-            text=test_message,
-            author_name='TEST_USER'
-        )
-        if success:
-            await ctx.send("✅ GroupMe send function working correctly!")
-            await ctx.send("Check GroupMe to see if the test message appeared.")
-        else:
-            await ctx.send("❌ GroupMe send function failed!")
-    except Exception as e:
-        await ctx.send(f"❌ GroupMe send function error: {e}")
-
-@bot.command(name='test_groupme_api')
-async def test_groupme_api(ctx):
-    """Test GroupMe API directly"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    await ctx.send("🧪 Testing GroupMe API directly...")
-    
-    test_payload = {
-        "bot_id": GROUPME_BOT_ID,
-        "text": f"Direct API test at {time.strftime('%H:%M:%S')}"
-    }
-    
-    try:
-        response = await make_http_request(GROUPME_POST_URL, 'POST', test_payload)
-        
-        embed = discord.Embed(
-            title="🔍 GroupMe API Test Results",
-            color=discord.Color.green() if response['status'] == 202 else discord.Color.red()
-        )
-        
-        embed.add_field(name="Status Code", value=response['status'], inline=True)
-        embed.add_field(name="Success", value="✅ Yes" if response['status'] == 202 else "❌ No", inline=True)
-        
-        response_text = response.get('text', 'No response')[:500]
-        embed.add_field(name="Response", value=f"```{response_text}```", inline=False)
-        
-        if response['status'] == 202:
-            embed.add_field(name="Note", value="202 status is success for GroupMe bot API", inline=False)
-        
-        await ctx.send(embed=embed)
-        
-    except Exception as e:
-        await ctx.send(f"❌ GroupMe API test failed: {e}")
-
-@bot.command(name='check_groupme_config')
-async def check_groupme_config(ctx):
-    """Check GroupMe configuration"""
-    if ctx.channel.id != DISCORD_CHANNEL_ID:
-        return
-    
-    embed = discord.Embed(
-        title="⚙️ GroupMe Configuration",
-        color=discord.Color.blue()
-    )
-    
-    embed.add_field(
-        name="Bot ID", 
-        value="✅ Set" if GROUPME_BOT_ID else "❌ Missing", 
-        inline=True
-    )
-    embed.add_field(
-        name="Access Token", 
-        value="✅ Set" if GROUPME_ACCESS_TOKEN else "❌ Missing", 
-        inline=True
-    )
-    embed.add_field(
-        name="Group ID", 
-        value="✅ Set" if GROUPME_GROUP_ID else "❌ Missing", 
-        inline=True
-    )
-    
-    if GROUPME_BOT_ID:
-        embed.add_field(
-            name="Bot ID (partial)", 
-            value=f"{GROUPME_BOT_ID[:8]}...", 
-            inline=True
-        )
-    
-    embed.add_field(
-        name="API Endpoint", 
-        value=GROUPME_POST_URL, 
-        inline=False
-    )
-    
-    await ctx.send(embed=embed)
-
-# Main Function with improved async handling
 def main():
-    """Enhanced main entry point with proper async context"""
+    """Main entry point"""
     if not DISCORD_BOT_TOKEN:
         logger.error("❌ DISCORD_BOT_TOKEN required!")
         return
@@ -2348,65 +817,43 @@ def main():
         logger.error("❌ DISCORD_CHANNEL_ID required!")
         return
     
-    logger.info("🚀 Starting ENHANCED GroupMe-Discord Bridge...")
-    logger.info("📬 Message queue enabled! (debug/retry only)")
-    logger.info("🔄 Retry logic enabled!")
-    logger.info("💾 Persistence enabled!")
-    logger.info("🔒 Thread safety enabled!")
-    logger.info("📊 Health monitoring enabled!")
-    logger.info("🛡️ BULLETPROOF simple duplicate detection enabled!")
-    logger.info(f"🔍 Sync verification enabled! (every {SYNC_CHECK_INTERVAL//60} minutes)")
-    logger.info(f"🔄 Auto re-queue missing: {'✅' if AUTO_REQUEUE_MISSING else '❌ (DISABLED - prevents spam)'}")
-    logger.info("⚡ DIRECT FLOW: Normal messages bypass queue to eliminate duplicates!")
+    logger.info("🚀 Starting FIXED GroupMe-Discord Bridge...")
+    logger.info("✅ Discord→GroupMe: DIRECT (no queue, no duplicates)")
+    logger.info("✅ GroupMe→Discord: Simple queue")
+    logger.info("✅ Sync verification: DISABLED")
+    logger.info("✅ Duplicate detection: SIMPLE (ID tracking only)")
     
-    # Start webhook server in a separate thread
+    # Start webhook server
     webhook_thread = start_webhook_server()
     time.sleep(2)
     
-    # Start bot with proper async context
+    # Start bot
     try:
-        # Create new event loop for the bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        async def run_bot_with_tasks():
-            """Run bot with background tasks"""
+        async def run_bot():
+            """Run bot"""
             try:
-                # Start background tasks
-                loop.create_task(enhanced_cleanup())
-                loop.create_task(health_monitor())
-                loop.create_task(message_queue_processor())  # Still needed for retries
-                loop.create_task(sync_verification_task())
-                
-                # Start the bot
                 await bot.start(DISCORD_BOT_TOKEN)
-                
             except Exception as e:
-                logger.error(f"❌ Bot startup error: {e}")
+                logger.error(f"❌ Bot error: {e}")
                 raise
         
-        # Run the bot with tasks
         try:
-            loop.run_until_complete(run_bot_with_tasks())
+            loop.run_until_complete(run_bot())
         except KeyboardInterrupt:
-            logger.info("🛑 Received interrupt signal, shutting down...")
+            logger.info("🛑 Shutting down...")
         except Exception as e:
-            logger.error(f"❌ Bot runtime error: {e}")
+            logger.error(f"❌ Runtime error: {e}")
         finally:
-            # Cleanup
-            save_failed_messages()
-            logger.info("💾 Saved any pending data")
-            
-            # Close the bot properly
             if not bot.is_closed():
                 loop.run_until_complete(bot.close())
-            
             loop.close()
-            logger.info("🔚 Bot shutdown complete")
+            logger.info("🔚 Shutdown complete")
             
     except Exception as e:
-        logger.error(f"❌ Critical startup error: {e}")
-        save_failed_messages()
+        logger.error(f"❌ Critical error: {e}")
 
 if __name__ == "__main__":
     main()
