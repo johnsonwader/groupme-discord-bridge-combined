@@ -96,11 +96,11 @@ sync_tracking = {
 }
 sync_tracking_lock = threading.Lock()
 
-# Synchronization check interval (in seconds)
-SYNC_CHECK_INTERVAL = 600  # 10 minutes
+# Synchronization check interval (in seconds) - DISABLED to prevent triplets
+SYNC_CHECK_INTERVAL = 3600  # Increased to 1 hour instead of 10 minutes
 SYNC_MESSAGE_WINDOW = 3600  # Check messages from last hour
-AUTO_REQUEUE_MISSING = False  # Set to False to prevent spam
-MAX_RESYNC_MESSAGES = 10
+AUTO_REQUEUE_MISSING = False  # KEEP DISABLED - was causing duplicate sends
+MAX_RESYNC_MESSAGES = 5  # Reduced from 10
 
 # ============================================================================
 # ROBUST DUPLICATE DETECTION SYSTEM
@@ -988,6 +988,9 @@ async def message_queue_processor():
     """Enhanced queue processor with duplicate protection"""
     logger.info("📬 Starting enhanced message queue processor...")
     
+    # Track processed messages to prevent duplicates
+    recently_processed = set()
+    
     while True:
         try:
             with health_stats_lock:
@@ -1000,6 +1003,25 @@ async def message_queue_processor():
             retries = msg_data.get('retries', 0)
             msg_type = msg_data.get('type', 'unknown')
             original_data = msg_data.get('original_data')
+            discord_message_id = msg_data.get('discord_message_id')
+            
+            # Create a unique processing ID for this specific message
+            if discord_message_id:
+                processing_id = f"{msg_type}:{discord_message_id}:{retries}"
+            else:
+                processing_id = f"{msg_type}:{hash(str(kwargs))}:{retries}"
+            
+            # Check if we've recently processed this exact message
+            if processing_id in recently_processed:
+                logger.warning(f"🚫 BLOCKING: Already processed {processing_id}")
+                continue
+            
+            # Add to recently processed (with cleanup)
+            recently_processed.add(processing_id)
+            if len(recently_processed) > 100:
+                recently_processed.clear()
+            
+            logger.info(f"📤 Processing {msg_type} message (ID: {processing_id}, attempt {retries + 1}/{MAX_RETRIES})")
             
             # Double-check for duplicates at processing time
             if original_data:
@@ -1011,12 +1033,11 @@ async def message_queue_processor():
                     duplicate_detector.mark_message_processed(original_data, "queue_processing")
                     continue
             
-            logger.info(f"📤 Processing {msg_type} message (attempt {retries + 1}/{MAX_RETRIES})")
-            
+            # Try to send the message
             success = await send_func(**kwargs)
             
             if success:
-                logger.info(f"✅ Message sent successfully")
+                logger.info(f"✅ Message sent successfully: {processing_id}")
                 if original_data:
                     # Determine platform based on message type
                     platform = "discord" if "discord" in msg_type else "groupme"
@@ -1024,13 +1045,13 @@ async def message_queue_processor():
             elif retries < MAX_RETRIES - 1:
                 msg_data['retries'] = retries + 1
                 wait_time = RETRY_DELAY_BASE ** (retries + 1)
-                logger.warning(f"⏳ Message failed, retrying in {wait_time}s...")
+                logger.warning(f"⏳ Message failed, retrying in {wait_time}s... ({processing_id})")
                 await asyncio.sleep(wait_time)
                 await message_queue.put(msg_data)
             else:
                 with failed_messages_lock:
                     failed_messages.append(msg_data)
-                logger.error(f"❌ Message failed after {MAX_RETRIES} attempts")
+                logger.error(f"❌ Message failed after {MAX_RETRIES} attempts: {processing_id}")
                 if original_data:
                     # Still mark as processed to prevent infinite retries
                     platform = "discord" if "discord" in msg_type else "groupme"
@@ -1043,13 +1064,21 @@ async def message_queue_processor():
 
 # Sync verification task
 async def sync_verification_task():
-    """Periodically verify message synchronization"""
-    await asyncio.sleep(60)
+    """Periodically verify message synchronization - LESS AGGRESSIVE"""
+    await asyncio.sleep(300)  # Wait 5 minutes after startup (increased)
     
     while True:
         try:
-            await asyncio.sleep(SYNC_CHECK_INTERVAL)
-            await verify_message_sync()
+            await asyncio.sleep(SYNC_CHECK_INTERVAL)  # Now 1 hour instead of 10 minutes
+            logger.info("🔍 Running periodic sync verification (read-only)")
+            
+            # Run sync verification but don't auto-requeue to prevent triplets
+            report, missing_gm, missing_dc = await verify_message_sync()
+            
+            if report and (missing_gm or missing_dc):
+                logger.info(f"📊 Sync check complete: {len(missing_gm)} missing on GroupMe, {len(missing_dc)} missing on Discord")
+                logger.info("ℹ️ Use !syncfix to manually resync if needed (auto-requeue disabled)")
+            
         except Exception as e:
             logger.error(f"Sync verification task error: {e}")
 
@@ -1244,11 +1273,13 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """Enhanced message handler"""
+    """Enhanced message handler with stronger duplicate protection"""
+    # Basic filters
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         await bot.process_commands(message)
         return
     
+    # Skip commands
     if message.content.startswith('!'):
         await bot.process_commands(message)
         return
@@ -1256,20 +1287,40 @@ async def on_message(message):
     discord_nickname = message.author.display_name
     discord_username = message.author.name
     
-    logger.info(f"📨 Processing Discord message from '{discord_nickname}' (username: {discord_username})")
+    # Create unique message identifier FIRST
+    message_id = str(message.id)
+    message_timestamp = message.created_at.timestamp()
     
+    logger.info(f"📨 Discord message received: ID={message_id} from '{discord_nickname}' content='{message.content[:30]}...'")
+    
+    # IMMEDIATE duplicate check with platform-specific ID
     discord_msg_data = {
-        'content': message.content,
-        'author': discord_nickname,
-        'username': discord_username,
-        'author_id': message.author.id,
-        'timestamp': time.time(),
-        'message_id': message.id
+        'text': message.content or "",
+        'name': discord_nickname,
+        'user_id': str(message.author.id),
+        'id': message_id,
+        'timestamp': message_timestamp
     }
     
-    with discord_messages_lock:
-        recent_discord_messages.append(discord_msg_data)
+    # Check if we've already processed this exact Discord message
+    is_duplicate, reason = duplicate_detector.check_message_duplicate(discord_msg_data, "discord_message", skip_content_check=True)
+    if is_duplicate:
+        logger.warning(f"🚫 Blocking duplicate Discord message: {message_id} - {reason}")
+        await bot.process_commands(message)
+        return
     
+    # Store in recent messages with thread safety
+    with discord_messages_lock:
+        recent_discord_messages.append({
+            'content': message.content,
+            'author': discord_nickname,
+            'username': discord_username,
+            'author_id': message.author.id,
+            'timestamp': time.time(),
+            'message_id': message.id
+        })
+    
+    # Detect reply context
     reply_context = None
     if message.reference and message.reference.message_id:
         try:
@@ -1283,8 +1334,10 @@ async def on_message(message):
         except:
             pass
     
+    # Build message content
     message_content = message.content or ""
     
+    # Handle attachments
     if message.attachments:
         attachment_info = []
         for attachment in message.attachments:
@@ -1299,40 +1352,46 @@ async def on_message(message):
             else:
                 message_content = ' '.join(attachment_info)
     
-    if message_content.strip():
-        message_data = {
-            'text': message_content,
-            'name': discord_nickname,
-            'user_id': str(message.author.id),
-            'id': str(message.id),
-            'timestamp': time.time()
-        }
-        
-        # Check for duplicates (only serious ones)
-        is_duplicate, reason = duplicate_detector.check_message_duplicate(message_data, "discord", skip_content_check=True)
-        if is_duplicate and reason in ["message_id_duplicate", "rate_limit_exceeded"]:
-            logger.info(f"🚫 Skipping duplicate Discord message: {reason}")
-            await bot.process_commands(message)
-            return
-        
-        if duplicate_detector.check_queue_duplicate(message_data):
-            logger.info(f"🚫 Message already queued for processing")
-            await bot.process_commands(message)
-            return
-        
-        await message_queue.put({
-            'send_func': send_to_groupme,
-            'kwargs': {
-                'text': message_content,
-                'author_name': discord_nickname,
-                'reply_context': reply_context
-            },
-            'type': 'discord_to_groupme',
-            'retries': 0,
-            'original_data': message_data
-        })
-        logger.info(f"📬 Queued message for GroupMe from '{discord_nickname}'")
+    # Only process if there's actual content
+    if not message_content.strip():
+        logger.info(f"⏩ Skipping empty message from {discord_nickname}")
+        await bot.process_commands(message)
+        return
     
+    # Final queue duplicate check with enhanced data
+    queue_msg_data = {
+        'text': message_content,
+        'name': discord_nickname,
+        'user_id': str(message.author.id),
+        'id': f"discord_msg_{message_id}",  # Unique queue ID
+        'timestamp': message_timestamp,
+        'type': 'discord_to_groupme'
+    }
+    
+    # Check if already queued
+    if duplicate_detector.check_queue_duplicate(queue_msg_data):
+        logger.warning(f"🚫 Message already queued: {message_id}")
+        await bot.process_commands(message)
+        return
+    
+    # Log the queuing action
+    logger.info(f"📬 Queuing Discord message {message_id} for GroupMe: '{message_content[:50]}...'")
+    
+    # Queue the message
+    await message_queue.put({
+        'send_func': send_to_groupme,
+        'kwargs': {
+            'text': message_content,
+            'author_name': discord_nickname,
+            'reply_context': reply_context
+        },
+        'type': 'discord_to_groupme',
+        'retries': 0,
+        'original_data': queue_msg_data,
+        'discord_message_id': message_id  # Track original Discord message
+    })
+    
+    logger.info(f"✅ Successfully queued message {message_id} from '{discord_nickname}'")
     await bot.process_commands(message)
 
 @bot.event
@@ -1834,6 +1893,71 @@ async def force_message(ctx, *, message_text):
         'type': 'force_test',
         'retries': 0
     })
+
+@bot.command(name='queue_info')
+async def queue_info(ctx):
+    """Show current queue status and recent activity"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    with health_stats_lock:
+        queue_size = health_stats["queue_size"]
+    
+    dup_stats = duplicate_detector.get_stats()
+    
+    embed = discord.Embed(
+        title="📬 Queue Information",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name="📊 Current Status", 
+                   value=f"Queue Size: {queue_size}\n"
+                         f"Messages Sent: {health_stats['messages_sent']}\n"
+                         f"Messages Failed: {health_stats['messages_failed']}", 
+                   inline=True)
+    
+    embed.add_field(name="🛡️ Duplicate Protection",
+                   value=f"Queue Duplicates Blocked: {dup_stats['queue_duplicates']}\n"
+                         f"ID Duplicates Blocked: {dup_stats['id_duplicates']}\n"
+                         f"Total Checked: {dup_stats['total_checked']}", 
+                   inline=True)
+    
+    embed.add_field(name="🔍 Recent Discord Messages",
+                   value=f"Tracked: {len(recent_discord_messages)}\n"
+                         f"Last: {recent_discord_messages[-1]['author'] if recent_discord_messages else 'None'}", 
+                   inline=True)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='test_single')
+async def test_single_message(ctx):
+    """Send a single test message to check for triplets"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    test_time = time.strftime('%H:%M:%S')
+    test_msg = f"Single test message at {test_time}"
+    
+    # Clear any potential duplicates first
+    duplicate_detector.reset_all_caches()
+    
+    await ctx.send(f"🧪 Sending single test: {test_msg}")
+    
+    # Send just one message to the queue
+    unique_id = f"test_single_{int(time.time())}"
+    await message_queue.put({
+        'send_func': send_to_groupme,
+        'kwargs': {
+            'text': test_msg,
+            'author_name': 'TEST_SINGLE'
+        },
+        'type': 'single_test',
+        'retries': 0,
+        'discord_message_id': unique_id
+    })
+    
+    await ctx.send(f"✅ Queued test message with ID: {unique_id}")
+    await ctx.send("Check GroupMe to see if you receive exactly ONE message.")
 
 # Main Function
 def main():
