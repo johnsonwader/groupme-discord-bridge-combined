@@ -19,12 +19,16 @@ from aiohttp import web
 import logging
 from typing import Dict, Any, Optional, List, Tuple, Set
 
-# Configure logging
+# Configure logging with more detail for debugging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Enable debug logging for the duplicate detector specifically
+dup_logger = logging.getLogger('duplicate_detector')
+dup_logger.setLevel(logging.DEBUG)
 
 print("🔥 ENHANCED BIDIRECTIONAL BRIDGE WITH ROBUST ANTI-DUPLICATION FEATURES STARTING!")
 
@@ -126,12 +130,12 @@ class RobustDuplicateDetector:
         # Webhook duplicate detection
         self.webhook_request_ids: Dict[str, float] = {}
         
-        # Configuration
-        self.RATE_LIMIT_SECONDS = 0.5
-        self.CONTENT_DUPLICATE_WINDOW = 300  # 5 minutes
-        self.MESSAGE_ID_TTL = 3600  # 1 hour
-        self.MAX_MESSAGES_PER_MINUTE = 15
-        self.WEBHOOK_DUPLICATE_WINDOW = 30  # 30 seconds
+        # Configuration - Made less aggressive
+        self.RATE_LIMIT_SECONDS = 0.05  # Only block messages < 50ms apart
+        self.CONTENT_DUPLICATE_WINDOW = 120  # Reduced from 5 minutes to 2 minutes
+        self.MESSAGE_ID_TTL = 1800  # Reduced from 1 hour to 30 minutes
+        self.MAX_MESSAGES_PER_MINUTE = 20  # Increased from 15
+        self.WEBHOOK_DUPLICATE_WINDOW = 15  # Reduced from 30 seconds
         
         # Temporary disable mechanism for debugging
         self.temporarily_disabled = False
@@ -170,8 +174,9 @@ class RobustDuplicateDetector:
     def _cleanup_old_data(self):
         """Remove old tracking data to prevent memory leaks"""
         current_time = time.time()
+        cleanup_count = 0
         
-        # Clean old message IDs
+        # Clean old message IDs (platform-specific)
         expired_ids = [
             msg_id for msg_id, timestamp in self.message_id_timestamps.items()
             if current_time - timestamp > self.MESSAGE_ID_TTL
@@ -179,6 +184,7 @@ class RobustDuplicateDetector:
         for msg_id in expired_ids:
             self.processed_message_ids.discard(msg_id)
             self.message_id_timestamps.pop(msg_id, None)
+            cleanup_count += 1
         
         # Clean old content hashes
         expired_hashes = [
@@ -187,6 +193,7 @@ class RobustDuplicateDetector:
         ]
         for content_hash in expired_hashes:
             self.content_hashes.pop(content_hash, None)
+            cleanup_count += 1
         
         # Clean old webhook requests
         expired_webhooks = [
@@ -195,6 +202,45 @@ class RobustDuplicateDetector:
         ]
         for req_id in expired_webhooks:
             self.webhook_request_ids.pop(req_id, None)
+            cleanup_count += 1
+        
+        # Clean old user rate limit data
+        expired_users = []
+        for user_id, msgs in self.user_recent_messages.items():
+            # Remove old messages from each user's deque
+            while msgs and current_time - msgs[0] > 300:  # 5 minutes
+                msgs.popleft()
+            # If no recent messages, remove the user entirely
+            if not msgs:
+                expired_users.append(user_id)
+        
+        for user_id in expired_users:
+            self.user_recent_messages.pop(user_id, None)
+            cleanup_count += 1
+        
+        if cleanup_count > 0:
+            logger.debug(f"🧹 Cleaned up {cleanup_count} expired duplicate detection entries")
+    
+    def reset_all_caches(self):
+        """Reset all caches - useful for debugging"""
+        with self._lock:
+            old_counts = {
+                'message_ids': len(self.processed_message_ids),
+                'content_hashes': len(self.content_hashes),
+                'queue_hashes': len(self.queued_message_hashes),
+                'webhook_requests': len(self.webhook_request_ids),
+                'user_tracking': len(self.user_recent_messages)
+            }
+            
+            self.processed_message_ids.clear()
+            self.message_id_timestamps.clear()
+            self.content_hashes.clear()
+            self.queued_message_hashes.clear()
+            self.webhook_request_ids.clear()
+            self.user_recent_messages.clear()
+            
+            logger.info(f"🧹 Reset all caches: {old_counts}")
+            return old_counts
     
     def check_webhook_duplicate(self, request_id: str = None, 
                               client_ip: str = None, 
@@ -241,18 +287,19 @@ class RobustDuplicateDetector:
             # If temporarily disabled, only check for basic duplicates
             if self.temporarily_disabled:
                 msg_id = message_data.get('id')
-                if msg_id and msg_id in self.processed_message_ids:
-                    return True, "message_id_duplicate"
                 if msg_id:
-                    self.processed_message_ids.add(msg_id)
-                    self.message_id_timestamps[msg_id] = time.time()
+                    platform_msg_id = f"{platform}:{msg_id}"
+                    if platform_msg_id in self.processed_message_ids:
+                        return True, "message_id_duplicate"
+                    self.processed_message_ids.add(platform_msg_id)
+                    self.message_id_timestamps[platform_msg_id] = time.time()
                 return False, "not_duplicate_disabled"
             
             self.stats['total_checked'] += 1
             current_time = time.time()
             
             # Cleanup old data periodically
-            if self.stats['total_checked'] % 100 == 0:
+            if self.stats['total_checked'] % 50 == 0:  # More frequent cleanup
                 self._cleanup_old_data()
             
             msg_id = message_data.get('id')
@@ -260,9 +307,15 @@ class RobustDuplicateDetector:
             author = message_data.get('name', 'Unknown')
             user_id = message_data.get('user_id', message_data.get('sender_id', ''))
             
-            # 1. Message ID duplicate check
-            if msg_id and msg_id in self.processed_message_ids:
-                logger.info(f"🚫 ID duplicate: {msg_id}")
+            # Create platform-specific message ID to prevent cross-platform conflicts
+            platform_msg_id = f"{platform}:{msg_id}" if msg_id else None
+            
+            logger.debug(f"🔍 Checking message: {platform_msg_id} from {author} on {platform}")
+            
+            # 1. Message ID duplicate check (platform-specific)
+            if platform_msg_id and platform_msg_id in self.processed_message_ids:
+                time_since = current_time - self.message_id_timestamps.get(platform_msg_id, 0)
+                logger.info(f"🚫 ID duplicate: {platform_msg_id} (last seen {time_since:.1f}s ago)")
                 self.stats['id_duplicates'] += 1
                 self.stats['duplicates_blocked'] += 1
                 return True, "message_id_duplicate"
@@ -273,7 +326,7 @@ class RobustDuplicateDetector:
                 if content_hash in self.content_hashes:
                     time_since = current_time - self.content_hashes[content_hash]
                     if time_since < self.CONTENT_DUPLICATE_WINDOW:
-                        logger.info(f"🚫 Content duplicate from {author}: {content[:30]}...")
+                        logger.info(f"🚫 Content duplicate from {author}: {content[:30]}... (last seen {time_since:.1f}s ago)")
                         self.stats['content_duplicates'] += 1
                         self.stats['duplicates_blocked'] += 1
                         return True, "content_duplicate"
@@ -282,33 +335,35 @@ class RobustDuplicateDetector:
             
             # 3. Enhanced rate limiting (more lenient)
             if user_id:
-                recent_msgs = self.user_recent_messages[user_id]
+                platform_user_id = f"{platform}:{user_id}"
+                recent_msgs = self.user_recent_messages[platform_user_id]
                 
                 # Remove old messages
                 while recent_msgs and current_time - recent_msgs[0] > 60:
                     recent_msgs.popleft()
                 
-                # Check rate limit
+                # Check rate limit (only for extreme cases)
                 if len(recent_msgs) >= self.MAX_MESSAGES_PER_MINUTE:
                     logger.warning(f"🚫 Rate limit exceeded for {author}: {len(recent_msgs)} msgs/min")
                     self.stats['rate_limited'] += 1
                     self.stats['duplicates_blocked'] += 1
                     return True, "rate_limit_exceeded"
                 
-                # More lenient time check - only block rapid-fire messages
-                if recent_msgs and current_time - recent_msgs[-1] < 0.1:
+                # Very lenient time check - only block super rapid messages
+                if recent_msgs and current_time - recent_msgs[-1] < 0.05:  # 50ms
                     time_diff = current_time - recent_msgs[-1]
-                    logger.info(f"🚫 Rate limited: {author} (waited {time_diff:.2f}s)")
+                    logger.info(f"🚫 Rate limited: {author} (waited {time_diff:.3f}s)")
                     self.stats['rate_limited'] += 1
                     self.stats['duplicates_blocked'] += 1
                     return True, "rate_limit_too_fast"
                 
                 recent_msgs.append(current_time)
             
-            # 4. Record message as processed
-            if msg_id:
-                self.processed_message_ids.add(msg_id)
-                self.message_id_timestamps[msg_id] = current_time
+            # 4. Record message as processed (platform-specific)
+            if platform_msg_id:
+                self.processed_message_ids.add(platform_msg_id)
+                self.message_id_timestamps[platform_msg_id] = current_time
+                logger.debug(f"✅ Recorded new message: {platform_msg_id}")
             
             return False, "not_duplicate"
     
@@ -333,11 +388,23 @@ class RobustDuplicateDetector:
             
             return False
     
-    def mark_message_processed(self, message_data: Dict[str, Any]):
+    def mark_message_processed(self, message_data: Dict[str, Any], platform: str = "unknown"):
         """Mark a message as successfully processed"""
         with self._lock:
             queue_hash = self._generate_queue_hash(message_data)
             self.queued_message_hashes.discard(queue_hash)
+            
+            # Also remove from processed message IDs if it's been too long
+            msg_id = message_data.get('id')
+            if msg_id:
+                platform_msg_id = f"{platform}:{msg_id}"
+                # Remove old entries to prevent buildup
+                current_time = time.time()
+                if platform_msg_id in self.message_id_timestamps:
+                    if current_time - self.message_id_timestamps[platform_msg_id] > 300:  # 5 minutes
+                        self.processed_message_ids.discard(platform_msg_id)
+                        self.message_id_timestamps.pop(platform_msg_id, None)
+                        logger.debug(f"🗑️ Removed old processed message: {platform_msg_id}")
     
     def is_system_overloaded(self) -> bool:
         """Check if system is overloaded"""
@@ -941,7 +1008,7 @@ async def message_queue_processor():
                 )
                 if is_duplicate:
                     logger.warning(f"🚫 Caught duplicate at processing stage: {reason}")
-                    duplicate_detector.mark_message_processed(original_data)
+                    duplicate_detector.mark_message_processed(original_data, "queue_processing")
                     continue
             
             logger.info(f"📤 Processing {msg_type} message (attempt {retries + 1}/{MAX_RETRIES})")
@@ -951,7 +1018,9 @@ async def message_queue_processor():
             if success:
                 logger.info(f"✅ Message sent successfully")
                 if original_data:
-                    duplicate_detector.mark_message_processed(original_data)
+                    # Determine platform based on message type
+                    platform = "discord" if "discord" in msg_type else "groupme"
+                    duplicate_detector.mark_message_processed(original_data, platform)
             elif retries < MAX_RETRIES - 1:
                 msg_data['retries'] = retries + 1
                 wait_time = RETRY_DELAY_BASE ** (retries + 1)
@@ -963,7 +1032,9 @@ async def message_queue_processor():
                     failed_messages.append(msg_data)
                 logger.error(f"❌ Message failed after {MAX_RETRIES} attempts")
                 if original_data:
-                    duplicate_detector.mark_message_processed(original_data)
+                    # Still mark as processed to prevent infinite retries
+                    platform = "discord" if "discord" in msg_type else "groupme"
+                    duplicate_detector.mark_message_processed(original_data, platform)
                 save_failed_messages()
                 
         except Exception as e:
@@ -1682,15 +1753,47 @@ async def clear_cache(ctx):
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    with duplicate_detector._lock:
-        duplicate_detector.processed_message_ids.clear()
-        duplicate_detector.message_id_timestamps.clear()
-        duplicate_detector.content_hashes.clear()
-        duplicate_detector.queued_message_hashes.clear()
-        duplicate_detector.webhook_request_ids.clear()
-        duplicate_detector.user_recent_messages.clear()
+    old_counts = duplicate_detector.reset_all_caches()
+    total_cleared = sum(old_counts.values())
     
-    await ctx.send("🧹 Duplicate detection cache cleared")
+    await ctx.send(f"🧹 Duplicate detection cache cleared!\n"
+                  f"Removed: {total_cleared} total entries\n"
+                  f"Details: {old_counts}")
+
+@bot.command(name='debug_dup')
+async def debug_duplicates(ctx):
+    """Show current duplicate detection state"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    stats = duplicate_detector.get_stats()
+    
+    embed = discord.Embed(
+        title="🔍 Duplicate Detection Debug Info",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name="📊 Current Tracking", 
+                   value=f"Message IDs: {stats['processed_ids_count']}\n"
+                         f"Content Hashes: {stats['content_hashes_count']}\n"
+                         f"Queue Hashes: {stats['queued_hashes_count']}\n"
+                         f"Webhook Requests: {stats['webhook_requests_count']}", 
+                   inline=True)
+    
+    embed.add_field(name="🚫 Block Counts",
+                   value=f"ID Duplicates: {stats['id_duplicates']}\n"
+                         f"Content Duplicates: {stats['content_duplicates']}\n"
+                         f"Rate Limited: {stats['rate_limited']}\n"
+                         f"Webhook Duplicates: {stats['webhook_duplicates']}", 
+                   inline=True)
+    
+    embed.add_field(name="⚡ Status",
+                   value=f"Disabled: {'YES' if stats['temporarily_disabled'] else 'NO'}\n"
+                         f"Overloaded: {'YES' if stats['system_overloaded'] else 'NO'}\n"
+                         f"Block Rate: {stats['duplicate_rate']:.1f}%", 
+                   inline=True)
+    
+    await ctx.send(embed=embed)
 
 @bot.command(name='debug_msg')
 async def debug_message(ctx):
@@ -1708,6 +1811,27 @@ async def debug_message(ctx):
             'author_name': 'DEBUG'
         },
         'type': 'debug_test',
+        'retries': 0
+    })
+
+@bot.command(name='force_msg')
+async def force_message(ctx, *, message_text):
+    """Force send a message bypassing duplicate detection"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    # Temporarily disable duplicate detection
+    duplicate_detector.temporarily_disable(10)
+    
+    await ctx.send(f"🔓 Force sending: {message_text}")
+    
+    await message_queue.put({
+        'send_func': send_to_groupme,
+        'kwargs': {
+            'text': f"FORCE: {message_text}",
+            'author_name': ctx.author.display_name
+        },
+        'type': 'force_test',
         'retries': 0
     })
 
