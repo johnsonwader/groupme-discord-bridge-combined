@@ -376,7 +376,8 @@ class RobustDuplicateDetector:
                 'queued_hashes_count': len(self.queued_message_hashes),
                 'webhook_requests_count': len(self.webhook_request_ids),
                 'duplicate_rate': (self.stats['duplicates_blocked'] / max(1, self.stats['total_checked'])) * 100,
-                'system_overloaded': self.is_system_overloaded()
+                'system_overloaded': self.is_system_overloaded(),
+                'temporarily_disabled': self.temporarily_disabled
             })
             return stats
     
@@ -779,7 +780,7 @@ async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_dis
     if actual_queued > 0:
         logger.info(f"✅ Actually queued {actual_queued} messages for resync")
     else:
-        logger.info("ℹ️ No messages needed resyncing (all recent or filtered)")}
+        logger.info("ℹ️ No messages needed resyncing (all recent or filtered)")
 
 # Enhanced reply detection
 async def detect_reply_context(data):
@@ -1412,6 +1413,7 @@ async def health_monitor():
 🌐 Webhook duplicates: {dup_stats["webhook_duplicates"]}
 📬 Queue duplicates: {dup_stats["queue_duplicates"]}
 ⚡ System overloaded: {"YES" if dup_stats["system_overloaded"] else "NO"}
+🔓 Temporarily disabled: {"YES" if dup_stats["temporarily_disabled"] else "NO"}
             """)
             
             # Alert if failure rate is high
@@ -1498,6 +1500,7 @@ async def status(ctx):
 📊 Total checked: {dup_stats["total_checked"]}
 🚫 Duplicates blocked: {dup_stats["duplicates_blocked"]} ({dup_stats["duplicate_rate"]:.1f}%)
 ⚡ System status: {"Overloaded" if dup_stats["system_overloaded"] else "Normal"}
+🔓 Temporarily disabled: {"YES" if dup_stats["temporarily_disabled"] else "NO"}
 
 **🔄 Sync Verification:**
 📊 Latest sync rate: {latest_sync_rate}
@@ -1545,6 +1548,8 @@ async def duplicate_stats(ctx):
     embed.add_field(name="🌐 Webhook Duplicates", value=stats['webhook_duplicates'], inline=True)
     embed.add_field(name="📬 Queue Duplicates", value=stats['queue_duplicates'], inline=True)
     embed.add_field(name="⚡ System Status", value="Overloaded" if stats['system_overloaded'] else "Normal", inline=True)
+    
+    embed.add_field(name="🔓 Disabled", value="YES" if stats['temporarily_disabled'] else "NO", inline=True)
     
     embed.add_field(name="💾 Tracking Data", 
                    value=f"IDs: {stats['processed_ids_count']}\nContent: {stats['content_hashes_count']}\nQueue: {stats['queued_hashes_count']}\nWebhook: {stats['webhook_requests_count']}", 
@@ -1737,6 +1742,7 @@ async def health_report(ctx):
     
     embed.add_field(name="🛡️ Duplicate Rate", value=f"{dup_stats['duplicate_rate']:.1f}%", inline=True)
     embed.add_field(name="⚡ System Status", value="Overloaded" if dup_stats['system_overloaded'] else "Normal", inline=True)
+    embed.add_field(name="🔓 Dup Detection", value="Disabled" if dup_stats['temporarily_disabled'] else "Enabled", inline=True)
     
     if stats["last_failure"]:
         last_fail = time.strftime('%H:%M:%S', time.localtime(stats["last_failure"]))
