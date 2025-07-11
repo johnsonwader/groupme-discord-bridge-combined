@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Enhanced GroupMe-Discord Bridge with Reliability and Robust Anti-Duplication Features
-Features: Multi-layered duplicate detection, message queue, retry logic, health monitoring, 
-persistence, thread safety, sync verification
 """
 
 import discord
@@ -20,7 +18,6 @@ from discord.ext import commands
 from aiohttp import web
 import logging
 from typing import Dict, Any, Optional, List, Tuple, Set
-import pickle
 
 # Configure logging
 logging.basicConfig(
@@ -52,10 +49,10 @@ bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # Enhanced Global State with Thread Safety
 bot_status = {"ready": False, "start_time": time.time()}
-message_mapping = {}  # Discord message ID -> GroupMe message ID
-reply_context_cache = {}  # Store messages for reply detection
-recent_discord_messages = deque(maxlen=20)  # Store Discord messages with nicknames
-recent_groupme_messages = deque(maxlen=20)  # Store GroupMe messages
+message_mapping = {}
+reply_context_cache = {}
+recent_discord_messages = deque(maxlen=20)
+recent_groupme_messages = deque(maxlen=20)
 
 # Thread-safe locks
 mapping_lock = threading.Lock()
@@ -83,23 +80,23 @@ health_stats_lock = threading.Lock()
 
 # Message retry configuration
 MAX_RETRIES = 3
-RETRY_DELAY_BASE = 2  # Exponential backoff base
+RETRY_DELAY_BASE = 2
 
 # Message synchronization tracking
 sync_tracking = {
-    "discord_messages": {},  # Message ID -> {content, author, timestamp}
-    "groupme_messages": {},  # Message ID -> {content, author, timestamp}
-    "verification_history": deque(maxlen=10),  # Store last 10 sync checks
+    "discord_messages": {},
+    "groupme_messages": {},
+    "verification_history": deque(maxlen=10),
     "last_sync_check": 0,
-    "synced_messages": deque(maxlen=500)  # Track successfully synced messages to prevent duplicates
+    "synced_messages": deque(maxlen=500)
 }
 sync_tracking_lock = threading.Lock()
 
 # Synchronization check interval (in seconds)
 SYNC_CHECK_INTERVAL = 600  # 10 minutes
 SYNC_MESSAGE_WINDOW = 3600  # Check messages from last hour
-AUTO_REQUEUE_MISSING = False  # Set to False to prevent spam - was likely causing issues!
-MAX_RESYNC_MESSAGES = 10  # Maximum messages to resync at once
+AUTO_REQUEUE_MISSING = False  # Set to False to prevent spam
+MAX_RESYNC_MESSAGES = 10
 
 # ============================================================================
 # ROBUST DUPLICATE DETECTION SYSTEM
@@ -112,7 +109,7 @@ class RobustDuplicateDetector:
         # Thread safety locks
         self._lock = threading.RLock()
         
-        # Message ID tracking (increased capacity)
+        # Message ID tracking
         self.processed_message_ids: Set[str] = set()
         self.message_id_timestamps: Dict[str, float] = {}
         
@@ -133,7 +130,7 @@ class RobustDuplicateDetector:
         self.RATE_LIMIT_SECONDS = 0.5
         self.CONTENT_DUPLICATE_WINDOW = 300  # 5 minutes
         self.MESSAGE_ID_TTL = 3600  # 1 hour
-        self.MAX_MESSAGES_PER_MINUTE = 15  # Increased from 10
+        self.MAX_MESSAGES_PER_MINUTE = 15
         self.WEBHOOK_DUPLICATE_WINDOW = 30  # 30 seconds
         
         # Temporary disable mechanism for debugging
@@ -154,22 +151,20 @@ class RobustDuplicateDetector:
         """Generate hash for content-based duplicate detection"""
         # Normalize content
         normalized = content.strip().lower()
-        # Remove common variations
         normalized = normalized.replace('\n', ' ').replace('\r', '')
-        normalized = ' '.join(normalized.split())  # Normalize whitespace
+        normalized = ' '.join(normalized.split())
         
-        # Create hash including author and platform to prevent cross-platform issues
+        # Create hash including author and platform
         hash_data = f"{normalized}:{author}:{platform}"
         return hashlib.md5(hash_data.encode()).hexdigest()
     
     def _generate_queue_hash(self, message_data: Dict[str, Any]) -> str:
         """Generate hash for queue-level duplicate detection"""
-        # Extract key components
         content = str(message_data.get('text', ''))
         author = str(message_data.get('name', ''))
         msg_type = str(message_data.get('type', ''))
         
-        hash_data = f"{content}:{author}:{msg_type}:{int(time.time() // 60)}"  # Per-minute bucket
+        hash_data = f"{content}:{author}:{msg_type}:{int(time.time() // 60)}"
         return hashlib.md5(hash_data.encode()).hexdigest()
     
     def _cleanup_old_data(self):
@@ -208,14 +203,11 @@ class RobustDuplicateDetector:
         with self._lock:
             current_time = time.time()
             
-            # Generate a request identifier
             if not request_id:
-                # Fallback: create ID from message content and timestamp
                 msg_id = message_data.get('id', '')
                 content = message_data.get('text', '')[:50]
                 request_id = f"{msg_id}:{content}:{client_ip}"
             
-            # Check if we've seen this exact request recently
             if request_id in self.webhook_request_ids:
                 time_diff = current_time - self.webhook_request_ids[request_id]
                 if time_diff < self.WEBHOOK_DUPLICATE_WINDOW:
@@ -224,7 +216,6 @@ class RobustDuplicateDetector:
                     self.stats['duplicates_blocked'] += 1
                     return True
             
-            # Record this request
             self.webhook_request_ids[request_id] = current_time
             return False
     
@@ -234,25 +225,20 @@ class RobustDuplicateDetector:
             self.temporarily_disabled = True
             logger.warning(f"🔓 Duplicate detection temporarily disabled for {seconds} seconds")
         
-        # Re-enable after specified time
         def re_enable():
             time.sleep(seconds)
             with self._lock:
                 self.temporarily_disabled = False
                 logger.info("🔒 Duplicate detection re-enabled")
         
-        import threading
         threading.Thread(target=re_enable, daemon=True).start()
     
     def check_message_duplicate(self, message_data: Dict[str, Any], 
                               platform: str = "unknown", 
-                              skip_content_check: bool = False) -> tuple[bool, str]:
-        """
-        Comprehensive duplicate detection
-        Returns: (is_duplicate, reason)
-        """
+                              skip_content_check: bool = False) -> Tuple[bool, str]:
+        """Comprehensive duplicate detection"""
         with self._lock:
-            # If temporarily disabled, only check for the most basic duplicates
+            # If temporarily disabled, only check for basic duplicates
             if self.temporarily_disabled:
                 msg_id = message_data.get('id')
                 if msg_id and msg_id in self.processed_message_ids:
@@ -274,14 +260,14 @@ class RobustDuplicateDetector:
             author = message_data.get('name', 'Unknown')
             user_id = message_data.get('user_id', message_data.get('sender_id', ''))
             
-            # 1. Message ID duplicate check (always do this)
+            # 1. Message ID duplicate check
             if msg_id and msg_id in self.processed_message_ids:
                 logger.info(f"🚫 ID duplicate: {msg_id}")
                 self.stats['id_duplicates'] += 1
                 self.stats['duplicates_blocked'] += 1
                 return True, "message_id_duplicate"
             
-            # 2. Content-based duplicate check (can be skipped for normal flow)
+            # 2. Content-based duplicate check (can be skipped)
             if not skip_content_check and content.strip():
                 content_hash = self._generate_content_hash(content, author, platform)
                 if content_hash in self.content_hashes:
@@ -292,19 +278,17 @@ class RobustDuplicateDetector:
                         self.stats['duplicates_blocked'] += 1
                         return True, "content_duplicate"
                 
-                # Record content hash
                 self.content_hashes[content_hash] = current_time
             
-            # 3. Enhanced rate limiting (more lenient for normal flow)
+            # 3. Enhanced rate limiting (more lenient)
             if user_id:
-                # Check recent message timestamps
                 recent_msgs = self.user_recent_messages[user_id]
                 
-                # Remove old messages (older than 1 minute)
+                # Remove old messages
                 while recent_msgs and current_time - recent_msgs[0] > 60:
                     recent_msgs.popleft()
                 
-                # Check rate limit (only for excessive bursts)
+                # Check rate limit
                 if len(recent_msgs) >= self.MAX_MESSAGES_PER_MINUTE:
                     logger.warning(f"🚫 Rate limit exceeded for {author}: {len(recent_msgs)} msgs/min")
                     self.stats['rate_limited'] += 1
@@ -312,14 +296,13 @@ class RobustDuplicateDetector:
                     return True, "rate_limit_exceeded"
                 
                 # More lenient time check - only block rapid-fire messages
-                if recent_msgs and current_time - recent_msgs[-1] < 0.1:  # Only block if < 0.1 seconds
+                if recent_msgs and current_time - recent_msgs[-1] < 0.1:
                     time_diff = current_time - recent_msgs[-1]
                     logger.info(f"🚫 Rate limited: {author} (waited {time_diff:.2f}s)")
                     self.stats['rate_limited'] += 1
                     self.stats['duplicates_blocked'] += 1
                     return True, "rate_limit_too_fast"
                 
-                # Record this message
                 recent_msgs.append(current_time)
             
             # 4. Record message as processed
@@ -340,12 +323,10 @@ class RobustDuplicateDetector:
                 self.stats['duplicates_blocked'] += 1
                 return True
             
-            # Add to queue tracking (with automatic cleanup)
             self.queued_message_hashes.add(queue_hash)
             
             # Keep queue tracking size manageable
             if len(self.queued_message_hashes) > 1000:
-                # Remove oldest 200 entries
                 old_hashes = list(self.queued_message_hashes)[:200]
                 for old_hash in old_hashes:
                     self.queued_message_hashes.discard(old_hash)
@@ -353,29 +334,32 @@ class RobustDuplicateDetector:
             return False
     
     def mark_message_processed(self, message_data: Dict[str, Any]):
-        """Mark a message as successfully processed (remove from queue tracking)"""
+        """Mark a message as successfully processed"""
         with self._lock:
             queue_hash = self._generate_queue_hash(message_data)
             self.queued_message_hashes.discard(queue_hash)
     
     def is_system_overloaded(self) -> bool:
-        """Check if system is overloaded and should be more aggressive"""
+        """Check if system is overloaded"""
         with self._lock:
             current_time = time.time()
             recent_blocks = sum(1 for timestamp in self.content_hashes.values() 
                            if current_time - timestamp < 60)
-            return recent_blocks > 50  # More than 50 duplicates in last minute
+            return recent_blocks > 50
     
     def get_stats(self) -> Dict[str, Any]:
         """Get duplicate detection statistics"""
         with self._lock:
             stats = self.stats.copy()
+            total_checked = max(1, self.stats['total_checked'])
+            duplicate_rate = (self.stats['duplicates_blocked'] / total_checked) * 100
+            
             stats.update({
                 'processed_ids_count': len(self.processed_message_ids),
                 'content_hashes_count': len(self.content_hashes),
                 'queued_hashes_count': len(self.queued_message_hashes),
                 'webhook_requests_count': len(self.webhook_request_ids),
-                'duplicate_rate': (self.stats['duplicates_blocked'] / max(1, self.stats['total_checked'])) * 100,
+                'duplicate_rate': duplicate_rate,
                 'system_overloaded': self.is_system_overloaded(),
                 'temporarily_disabled': self.temporarily_disabled
             })
@@ -424,7 +408,6 @@ def save_failed_messages():
         with failed_messages_lock:
             if failed_messages:
                 with open(FAILED_MESSAGES_FILE, 'w') as f:
-                    # Convert deque to list for JSON serialization
                     messages = list(failed_messages)
                     json.dump(messages, f)
                 logger.info(f"💾 Saved {len(messages)} failed messages to disk")
@@ -496,7 +479,6 @@ async def make_http_request(url, method='GET', data=None, headers=None, retries=
                         if response.status == 200:
                             return result
                 
-                # If we get here, request failed
                 if attempt < retries - 1:
                     wait_time = RETRY_DELAY_BASE ** attempt
                     logger.warning(f"⏳ HTTP {response.status}, retrying in {wait_time}s...")
@@ -543,7 +525,7 @@ async def fetch_recent_discord_messages(limit=100):
                     'author': message.author.display_name,
                     'timestamp': message.created_at.timestamp(),
                     'has_attachments': len(message.attachments) > 0,
-                    'raw_message': message  # Store for potential resync
+                    'raw_message': message
                 })
         
         return messages
@@ -559,7 +541,6 @@ async def fetch_recent_groupme_messages_detailed(limit=100):
         
         filtered_messages = []
         for msg in messages:
-            # Skip bot messages and old messages
             if msg.get('sender_type') != 'bot' and (current_time - msg.get('created_at', 0)) <= SYNC_MESSAGE_WINDOW:
                 filtered_messages.append({
                     'id': msg.get('id'),
@@ -567,7 +548,7 @@ async def fetch_recent_groupme_messages_detailed(limit=100):
                     'author': msg.get('name', 'Unknown'),
                     'timestamp': msg.get('created_at', 0),
                     'has_attachments': bool(msg.get('attachments', [])),
-                    'raw_message': msg  # Store for potential resync
+                    'raw_message': msg
                 })
         
         return filtered_messages
@@ -581,9 +562,9 @@ def normalize_message_content(content):
         return ""
     
     # Remove bridge-specific formatting
-    content = re.sub(r'^[^:]+: ', '', content)  # Remove "Author: " prefix
-    content = re.sub(r'^\*\*[^*]+\*\*: ', '', content)  # Remove "**Author**: " prefix
-    content = re.sub(r'↪️ \*\*[^*]+\*\*.*?\n\n', '', content, flags=re.DOTALL)  # Remove reply formatting
+    content = re.sub(r'^[^:]+: ', '', content)
+    content = re.sub(r'^\*\*[^*]+\*\*: ', '', content)
+    content = re.sub(r'↪️ \*\*[^*]+\*\*.*?\n\n', '', content, flags=re.DOTALL)
     
     # Normalize whitespace
     content = ' '.join(content.split())
@@ -597,26 +578,20 @@ def find_matching_message(message, target_messages, time_tolerance=60):
         return None
     
     for target_msg in target_messages:
-        # Check time proximity (within tolerance)
         time_diff = abs(message['timestamp'] - target_msg['timestamp'])
         if time_diff > time_tolerance:
             continue
         
-        # Check content match
         target_normalized = normalize_message_content(target_msg['content'])
         
-        # Handle attachment-only messages
         if not normalized_content and not target_normalized:
             if message.get('has_attachments') and target_msg.get('has_attachments'):
                 return target_msg
         
-        # Check content similarity (exact match after normalization)
         if normalized_content and target_normalized and normalized_content == target_normalized:
             return target_msg
         
-        # Check partial match for very similar content
         if normalized_content and target_normalized:
-            # Check if one contains the other (handling truncation)
             if normalized_content in target_normalized or target_normalized in normalized_content:
                 return target_msg
     
@@ -627,13 +602,11 @@ async def verify_message_sync():
     try:
         logger.info("🔍 Starting message synchronization verification...")
         
-        # Fetch recent messages from both platforms
         discord_messages = await fetch_recent_discord_messages()
         groupme_messages = await fetch_recent_groupme_messages_detailed()
         
         logger.info(f"📊 Found {len(discord_messages)} Discord messages and {len(groupme_messages)} GroupMe messages")
         
-        # Check for missing messages
         missing_on_groupme = []
         missing_on_discord = []
         
@@ -641,7 +614,6 @@ async def verify_message_sync():
         for discord_msg in discord_messages:
             match = find_matching_message(discord_msg, groupme_messages)
             if not match:
-                # Check if already marked as synced to prevent duplicate resync
                 if not is_message_already_synced(discord_msg['content'], discord_msg['author'], discord_msg['timestamp']):
                     missing_on_groupme.append(discord_msg)
         
@@ -649,7 +621,6 @@ async def verify_message_sync():
         for groupme_msg in groupme_messages:
             match = find_matching_message(groupme_msg, discord_messages)
             if not match:
-                # Check if already marked as synced to prevent duplicate resync
                 if not is_message_already_synced(groupme_msg['content'], groupme_msg['author'], groupme_msg['timestamp']):
                     missing_on_discord.append(groupme_msg)
         
@@ -673,16 +644,12 @@ async def verify_message_sync():
             sync_tracking['verification_history'].append(sync_report)
             sync_tracking['last_sync_check'] = time.time()
         
-        # Log results
         if missing_on_groupme or missing_on_discord:
-            logger.warning(f"""
-⚠️  SYNC VERIFICATION ISSUE DETECTED:
-Missing on GroupMe: {len(missing_on_groupme)} messages
-Missing on Discord: {len(missing_on_discord)} messages
-Sync Rate: {sync_report['sync_rate']:.1f}%
-            """)
+            logger.warning(f"⚠️ SYNC VERIFICATION ISSUE DETECTED:")
+            logger.warning(f"Missing on GroupMe: {len(missing_on_groupme)} messages")
+            logger.warning(f"Missing on Discord: {len(missing_on_discord)} messages")
+            logger.warning(f"Sync Rate: {sync_report['sync_rate']:.1f}%")
             
-            # Log details of missing messages (first 5 of each)
             if missing_on_groupme:
                 logger.info("Missing on GroupMe:")
                 for msg in missing_on_groupme[:5]:
@@ -693,7 +660,6 @@ Sync Rate: {sync_report['sync_rate']:.1f}%
                 for msg in missing_on_discord[:5]:
                     logger.info(f"  - {msg['author']}: {msg['content'][:50]}...")
             
-            # Optionally re-queue missing messages (DISABLED BY DEFAULT to prevent spam)
             if AUTO_REQUEUE_MISSING:
                 logger.info("🔄 Auto-requeue is enabled, re-syncing missing messages...")
                 await resync_missing_messages(missing_on_groupme, missing_on_discord)
@@ -710,7 +676,6 @@ Sync Rate: {sync_report['sync_rate']:.1f}%
 
 async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_discord: List[Dict]):
     """Resync missing messages without creating duplicates"""
-    # Limit the number of messages to resync
     resync_to_groupme = missing_on_groupme[:MAX_RESYNC_MESSAGES]
     resync_to_discord = missing_on_discord[:MAX_RESYNC_MESSAGES]
     
@@ -718,7 +683,7 @@ async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_dis
     
     # Resync Discord messages to GroupMe
     for msg in resync_to_groupme:
-        # Skip if message is very recent (likely already in progress)
+        # Skip if message is very recent
         if time.time() - msg['timestamp'] < 30:
             logger.info(f"⏩ Skipping recent message from {msg['author']} (too recent)")
             continue
@@ -728,7 +693,6 @@ async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_dis
             logger.info(f"⏩ Skipping command message: {msg['content']}")
             continue
         
-        # Mark as synced before sending to prevent duplicate resync
         mark_message_as_synced(msg['content'], msg['author'], msg['timestamp'])
         
         logger.info(f"🔄 Re-syncing Discord message from {msg['author']}: {msg['content'][:50]}...")
@@ -750,12 +714,10 @@ async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_dis
     
     # Resync GroupMe messages to Discord
     for msg in resync_to_discord:
-        # Skip if message is very recent
         if time.time() - msg['timestamp'] < 30:
             logger.info(f"⏩ Skipping recent message from {msg['author']} (too recent)")
             continue
         
-        # Mark as synced before sending to prevent duplicate resync
         mark_message_as_synced(msg['content'], msg['author'], msg['timestamp'])
         
         logger.info(f"🔄 Re-syncing GroupMe message from {msg['author']}: {msg['content'][:50]}...")
@@ -784,7 +746,7 @@ async def resync_missing_messages(missing_on_groupme: List[Dict], missing_on_dis
 
 # Enhanced reply detection
 async def detect_reply_context(data):
-    """Enhanced reply detection with better Discord nickname matching"""
+    """Enhanced reply detection"""
     reply_context = None
     
     # Method 1: Official GroupMe reply attachments
@@ -806,14 +768,13 @@ async def detect_reply_context(data):
                         }
                         logger.info(f"✅ Found official reply to {reply_context['name']}")
     
-    # Method 2: Enhanced @mention detection with nickname support
+    # Method 2: Enhanced @mention detection
     if not reply_context and data.get('text'):
         text = data['text']
         mention_match = re.search(r'@(\w+)', text, re.IGNORECASE)
         if mention_match:
             mentioned_name = mention_match.group(1).lower()
             
-            # Check recent Discord messages with enhanced matching
             with discord_messages_lock:
                 for discord_msg in reversed(recent_discord_messages):
                     display_name = discord_msg['author'].lower()
@@ -863,7 +824,7 @@ async def convert_discord_mentions_to_nicknames(text):
                     text = text.replace(original_mention, readable_mention)
                     text = text.replace(nickname_mention, readable_mention)
                     
-                    logger.info(f"🏷️  Converted mention: {user_id} → @{display_name}")
+                    logger.info(f"🏷️ Converted mention: {user_id} → @{display_name}")
                     
             except Exception as e:
                 logger.error(f"❌ Error converting mention for user ID {user_id}: {e}")
@@ -875,14 +836,12 @@ async def convert_discord_mentions_to_nicknames(text):
         logger.error(f"❌ Error in mention conversion: {e}")
         return text
 
-# Message sending functions with queue integration
+# Message sending functions
 async def send_to_groupme(text, author_name=None, reply_context=None):
     """Send message to GroupMe with retry logic"""
     try:
-        # Convert Discord mentions
         text = await convert_discord_mentions_to_nicknames(text)
         
-        # Format reply context
         if reply_context:
             quoted_text = reply_context.get('text', 'previous message')
             reply_author = reply_context.get('name', 'Someone')
@@ -922,7 +881,6 @@ async def send_to_discord(message, reply_context=None):
         content = message.get('text', '[No text content]')
         author = message.get('name', 'GroupMe User')
         
-        # Format reply context
         if reply_context:
             original_text = reply_context.get('text', '[No text]')
             original_author = reply_context.get('name', 'Unknown')
@@ -936,11 +894,9 @@ async def send_to_discord(message, reply_context=None):
                 if attachment.get('type') == 'image' and attachment.get('url'):
                     embeds.append(discord.Embed().set_image(url=attachment['url']))
         
-        # Send message
         formatted_content = f"**{author}:** {content}" if content else f"**{author}** sent an attachment"
         sent_message = await discord_channel.send(formatted_content, embeds=embeds)
         
-        # Store mapping with thread safety
         if message.get('id'):
             with mapping_lock:
                 message_mapping[sent_message.id] = message['id']
@@ -960,21 +916,18 @@ async def send_to_discord(message, reply_context=None):
         update_health_stats(False)
         return False
 
-# Enhanced message queue processor with duplicate protection
+# Enhanced message queue processor
 async def message_queue_processor():
     """Enhanced queue processor with duplicate protection"""
     logger.info("📬 Starting enhanced message queue processor...")
     
     while True:
         try:
-            # Update queue size for health monitoring
             with health_stats_lock:
                 health_stats["queue_size"] = message_queue.qsize()
             
-            # Get message from queue
             msg_data = await message_queue.get()
             
-            # Extract message details
             send_func = msg_data['send_func']
             kwargs = msg_data['kwargs']
             retries = msg_data.get('retries', 0)
@@ -983,7 +936,6 @@ async def message_queue_processor():
             
             # Double-check for duplicates at processing time
             if original_data:
-                # Quick duplicate check (this should rarely trigger)
                 is_duplicate, reason = duplicate_detector.check_message_duplicate(
                     original_data, "queue_processing"
                 )
@@ -994,27 +946,22 @@ async def message_queue_processor():
             
             logger.info(f"📤 Processing {msg_type} message (attempt {retries + 1}/{MAX_RETRIES})")
             
-            # Try to send the message
             success = await send_func(**kwargs)
             
             if success:
                 logger.info(f"✅ Message sent successfully")
-                # Mark as processed in duplicate detector
                 if original_data:
                     duplicate_detector.mark_message_processed(original_data)
             elif retries < MAX_RETRIES - 1:
-                # Retry with exponential backoff
                 msg_data['retries'] = retries + 1
                 wait_time = RETRY_DELAY_BASE ** (retries + 1)
                 logger.warning(f"⏳ Message failed, retrying in {wait_time}s...")
                 await asyncio.sleep(wait_time)
                 await message_queue.put(msg_data)
             else:
-                # Max retries reached, add to failed messages
                 with failed_messages_lock:
                     failed_messages.append(msg_data)
                 logger.error(f"❌ Message failed after {MAX_RETRIES} attempts")
-                # Still mark as processed to prevent infinite retries
                 if original_data:
                     duplicate_detector.mark_message_processed(original_data)
                 save_failed_messages()
@@ -1026,7 +973,7 @@ async def message_queue_processor():
 # Sync verification task
 async def sync_verification_task():
     """Periodically verify message synchronization"""
-    await asyncio.sleep(60)  # Wait a minute after startup
+    await asyncio.sleep(60)
     
     while True:
         try:
@@ -1035,7 +982,7 @@ async def sync_verification_task():
         except Exception as e:
             logger.error(f"Sync verification task error: {e}")
 
-# Enhanced webhook server with robust duplicate detection
+# Enhanced webhook server
 async def run_webhook_server():
     """Enhanced webhook server with multi-layered duplicate protection"""
     
@@ -1047,7 +994,6 @@ async def run_webhook_server():
             last_sync = sync_tracking.get('last_sync_check', 0)
             sync_history = list(sync_tracking['verification_history'])
         
-        # Get duplicate detection stats
         dup_stats = duplicate_detector.get_stats()
         
         latest_sync_rate = "N/A"
@@ -1086,9 +1032,8 @@ async def run_webhook_server():
         start_time = time.time()
         
         try:
-            # Get client info for webhook-level duplicate detection
             client_ip = request.remote
-            request_id = request.headers.get('X-Request-ID')  # If GroupMe provides this
+            request_id = request.headers.get('X-Request-ID')
             
             data = await request.json()
             sender_info = f"{data.get('name', 'Unknown')} ({data.get('sender_type', 'unknown')})"
@@ -1098,7 +1043,7 @@ async def run_webhook_server():
             if duplicate_detector.check_webhook_duplicate(request_id, client_ip, data):
                 return web.json_response({"status": "ignored", "reason": "webhook_duplicate"})
             
-            # 2. Bot message filter (before other checks)
+            # 2. Bot message filter
             if is_bot_message(data):
                 logger.info(f"🤖 Ignoring bot message from {data.get('name', 'Unknown')}")
                 return web.json_response({"status": "ignored", "reason": "bot_message"})
@@ -1106,7 +1051,6 @@ async def run_webhook_server():
             # 3. Comprehensive duplicate check (less aggressive for normal flow)
             is_duplicate, reason = duplicate_detector.check_message_duplicate(data, "groupme", skip_content_check=False)
             if is_duplicate and reason in ["message_id_duplicate", "rate_limit_exceeded", "rate_limit_too_fast"]:
-                # Only block for serious duplicates, not content duplicates in normal flow
                 return web.json_response({"status": "ignored", "reason": reason})
             
             # 4. Queue-level duplicate check
@@ -1130,28 +1074,24 @@ async def run_webhook_server():
             # Check if bot is ready
             if not bot.is_ready():
                 logger.warning("⏳ Bot not ready, queuing message...")
-                # Wait a bit for bot to be ready
                 ready = await wait_for_bot_ready(timeout=5)
                 if not ready:
                     logger.error("❌ Bot still not ready after timeout")
             
-            # Detect reply context
             reply_context = await detect_reply_context(data)
             
-            # Queue the message for Discord
             message_item = {
                 'send_func': send_to_discord,
                 'kwargs': {'message': data, 'reply_context': reply_context},
                 'type': 'groupme_to_discord',
                 'retries': 0,
-                'original_data': data  # For duplicate tracking
+                'original_data': data
             }
             
             await message_queue.put(message_item)
             
-            # Log processing time to detect potential timeout issues
             processing_time = time.time() - start_time
-            if processing_time > 3.0:  # Warn if taking too long
+            if processing_time > 3.0:
                 logger.warning(f"⚠️ Slow webhook processing: {processing_time:.3f}s - may cause retries")
             else:
                 logger.debug(f"⏱️ Webhook processed in {processing_time:.3f}s")
@@ -1217,18 +1157,15 @@ async def on_ready():
     logger.info(f'🔍 Sync verification: ✅ (every {SYNC_CHECK_INTERVAL//60} min)')
     logger.info(f'🔄 Auto-requeue missing: {"✅" if AUTO_REQUEUE_MISSING else "❌ (DISABLED)"}')
     
-    # Start the message queue processor
+    # Start tasks
     asyncio.create_task(message_queue_processor())
-    
-    # Start sync verification task
     asyncio.create_task(sync_verification_task())
     
-    # Load and retry any failed messages
+    # Load failed messages
     failed = load_failed_messages()
     if failed:
         for msg in failed:
             await message_queue.put(msg)
-        # Clear the file after loading
         try:
             os.remove(FAILED_MESSAGES_FILE)
         except:
@@ -1236,24 +1173,20 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """Enhanced message handler with queue integration"""
-    # Basic filters
+    """Enhanced message handler"""
     if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
         await bot.process_commands(message)
         return
     
-    # Skip commands
     if message.content.startswith('!'):
         await bot.process_commands(message)
         return
     
-    # Get Discord display name
     discord_nickname = message.author.display_name
     discord_username = message.author.name
     
     logger.info(f"📨 Processing Discord message from '{discord_nickname}' (username: {discord_username})")
     
-    # Store in recent messages with thread safety
     discord_msg_data = {
         'content': message.content,
         'author': discord_nickname,
@@ -1266,7 +1199,6 @@ async def on_message(message):
     with discord_messages_lock:
         recent_discord_messages.append(discord_msg_data)
     
-    # Detect reply context
     reply_context = None
     if message.reference and message.reference.message_id:
         try:
@@ -1280,10 +1212,8 @@ async def on_message(message):
         except:
             pass
     
-    # Build message content
     message_content = message.content or ""
     
-    # Handle attachments
     if message.attachments:
         attachment_info = []
         for attachment in message.attachments:
@@ -1298,9 +1228,7 @@ async def on_message(message):
             else:
                 message_content = ' '.join(attachment_info)
     
-    # Queue message for GroupMe with duplicate detection
     if message_content.strip():
-        # Create message data for duplicate detection
         message_data = {
             'text': message_content,
             'name': discord_nickname,
@@ -1309,15 +1237,13 @@ async def on_message(message):
             'timestamp': time.time()
         }
         
-        # Check for duplicates before queuing (only serious duplicates)
+        # Check for duplicates (only serious ones)
         is_duplicate, reason = duplicate_detector.check_message_duplicate(message_data, "discord", skip_content_check=True)
         if is_duplicate and reason in ["message_id_duplicate", "rate_limit_exceeded"]:
-            # Only block for serious duplicates, allow content variations
             logger.info(f"🚫 Skipping duplicate Discord message: {reason}")
             await bot.process_commands(message)
             return
         
-        # Check queue duplicates
         if duplicate_detector.check_queue_duplicate(message_data):
             logger.info(f"🚫 Message already queued for processing")
             await bot.process_commands(message)
@@ -1340,7 +1266,7 @@ async def on_message(message):
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Handle reaction additions with queue integration"""
+    """Handle reaction additions"""
     if (user.bot or reaction.message.channel.id != DISCORD_CHANNEL_ID):
         return
     
@@ -1349,11 +1275,9 @@ async def on_reaction_add(reaction, user):
     
     logger.info(f"😀 Processing reaction {emoji} from '{discord_nickname}'")
     
-    # Queue reaction for GroupMe
     original_content = reaction.message.content[:50] if reaction.message.content else "a message"
     reaction_text = f"{discord_nickname} reacted {emoji} to '{original_content}...'"
     
-    # Create message data for duplicate detection
     reaction_data = {
         'text': reaction_text,
         'name': discord_nickname,
@@ -1362,7 +1286,6 @@ async def on_reaction_add(reaction, user):
         'timestamp': time.time()
     }
     
-    # Check for duplicates
     is_duplicate, reason = duplicate_detector.check_message_duplicate(reaction_data, "discord_reaction")
     if not is_duplicate and not duplicate_detector.check_queue_duplicate(reaction_data):
         await message_queue.put({
@@ -1386,7 +1309,6 @@ async def health_monitor():
             with health_stats_lock:
                 stats = health_stats.copy()
             
-            # Get duplicate detection stats
             dup_stats = duplicate_detector.get_stats()
             
             total_messages = stats["messages_sent"] + stats["messages_failed"]
@@ -1395,36 +1317,31 @@ async def health_monitor():
             else:
                 success_rate = 100
             
-            logger.info(f"""
-📊 BRIDGE HEALTH REPORT:
-✅ Messages sent: {stats["messages_sent"]}
-❌ Messages failed: {stats["messages_failed"]}
-📈 Success rate: {success_rate:.1f}%
-📬 Queue size: {stats["queue_size"]}
-💾 Failed messages: {len(failed_messages)}
-⏰ Last success: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats["last_success"]))}
-
-🛡️ DUPLICATE DETECTION STATS:
-📊 Total checked: {dup_stats["total_checked"]}
-🚫 Duplicates blocked: {dup_stats["duplicates_blocked"]} ({dup_stats["duplicate_rate"]:.1f}%)
-🔗 ID duplicates: {dup_stats["id_duplicates"]}
-📝 Content duplicates: {dup_stats["content_duplicates"]}
-⏱️ Rate limited: {dup_stats["rate_limited"]}
-🌐 Webhook duplicates: {dup_stats["webhook_duplicates"]}
-📬 Queue duplicates: {dup_stats["queue_duplicates"]}
-⚡ System overloaded: {"YES" if dup_stats["system_overloaded"] else "NO"}
-🔓 Temporarily disabled: {"YES" if dup_stats["temporarily_disabled"] else "NO"}
-            """)
+            logger.info("📊 BRIDGE HEALTH REPORT:")
+            logger.info(f"✅ Messages sent: {stats['messages_sent']}")
+            logger.info(f"❌ Messages failed: {stats['messages_failed']}")
+            logger.info(f"📈 Success rate: {success_rate:.1f}%")
+            logger.info(f"📬 Queue size: {stats['queue_size']}")
+            logger.info(f"💾 Failed messages: {len(failed_messages)}")
+            logger.info(f"⏰ Last success: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stats['last_success']))}")
             
-            # Alert if failure rate is high
+            logger.info("🛡️ DUPLICATE DETECTION STATS:")
+            logger.info(f"📊 Total checked: {dup_stats['total_checked']}")
+            logger.info(f"🚫 Duplicates blocked: {dup_stats['duplicates_blocked']} ({dup_stats['duplicate_rate']:.1f}%)")
+            logger.info(f"🔗 ID duplicates: {dup_stats['id_duplicates']}")
+            logger.info(f"📝 Content duplicates: {dup_stats['content_duplicates']}")
+            logger.info(f"⏱️ Rate limited: {dup_stats['rate_limited']}")
+            logger.info(f"🌐 Webhook duplicates: {dup_stats['webhook_duplicates']}")
+            logger.info(f"📬 Queue duplicates: {dup_stats['queue_duplicates']}")
+            logger.info(f"⚡ System overloaded: {'YES' if dup_stats['system_overloaded'] else 'NO'}")
+            logger.info(f"🔓 Temporarily disabled: {'YES' if dup_stats['temporarily_disabled'] else 'NO'}")
+            
             if success_rate < 90 and total_messages > 10:
-                logger.warning(f"⚠️  High failure rate detected: {100-success_rate:.1f}%")
+                logger.warning(f"⚠️ High failure rate detected: {100-success_rate:.1f}%")
             
-            # Alert if too many duplicates
             if dup_stats["duplicate_rate"] > 20 and dup_stats["total_checked"] > 50:
-                logger.warning(f"⚠️  High duplicate rate detected: {dup_stats['duplicate_rate']:.1f}%")
+                logger.warning(f"⚠️ High duplicate rate detected: {dup_stats['duplicate_rate']:.1f}%")
             
-            # Save failed messages periodically
             save_failed_messages()
             
         except Exception as e:
@@ -1437,32 +1354,28 @@ async def enhanced_cleanup():
         try:
             await asyncio.sleep(3600)  # Every hour
             
-            # Clean old mappings with thread safety
             with mapping_lock:
                 if len(message_mapping) > 500:
                     old_keys = list(message_mapping.keys())[:-500]
                     for key in old_keys:
                         message_mapping.pop(key, None)
             
-            # Clean old reply cache
             with cache_lock:
                 if len(reply_context_cache) > 200:
                     old_keys = list(reply_context_cache.keys())[:-200]
                     for key in old_keys:
                         reply_context_cache.pop(key, None)
             
-            # Save any pending failed messages
             save_failed_messages()
-            
             logger.info("🧹 Cleanup completed")
             
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
 
-# Enhanced Bot Commands
+# Bot Commands
 @bot.command(name='status')
 async def status(ctx):
-    """Enhanced status command with health stats and sync info"""
+    """Enhanced status command"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
@@ -1473,13 +1386,11 @@ async def status(ctx):
         last_sync = sync_tracking.get('last_sync_check', 0)
         sync_history = list(sync_tracking['verification_history'])
     
-    # Get duplicate detection stats
     dup_stats = duplicate_detector.get_stats()
     
     total_messages = stats["messages_sent"] + stats["messages_failed"]
     success_rate = (stats["messages_sent"] / total_messages * 100) if total_messages > 0 else 100
     
-    # Get latest sync rate
     latest_sync_rate = "N/A"
     if sync_history:
         latest_sync_rate = f"{sync_history[-1]['sync_rate']:.1f}%"
@@ -1607,7 +1518,6 @@ async def sync_fix(ctx):
     
     await ctx.send("🔍 Running sync verification with manual fix...")
     
-    # Run sync verification without auto-requeue
     report, missing_gm, missing_dc = await verify_message_sync()
     
     if report:
@@ -1617,7 +1527,6 @@ async def sync_fix(ctx):
             await ctx.send("✅ All messages are properly synced!")
             return
         
-        # Show what would be resynced
         embed = discord.Embed(
             title="🔍 Sync Check Results",
             color=discord.Color.orange()
@@ -1626,7 +1535,6 @@ async def sync_fix(ctx):
         embed.add_field(name="⚠️ Missing on GroupMe", value=len(missing_gm), inline=True)
         embed.add_field(name="⚠️ Missing on Discord", value=len(missing_dc), inline=True)
         
-        # Show sample missing messages
         if missing_gm:
             sample_gm = missing_gm[:3]
             gm_list = "\n".join([f"- {msg['author']}: {msg['content'][:30]}..." for msg in sample_gm])
@@ -1639,15 +1547,13 @@ async def sync_fix(ctx):
         
         await ctx.send(embed=embed)
         
-        # Ask for confirmation with a simpler approach
         if total_missing <= 5:
             await ctx.send(f"Would you like to resync these {total_missing} messages? React with ✅ to proceed or ❌ to cancel.")
             
-            # Actually perform the resync (more conservative)
             logger.info(f"Manual sync fix requested for {total_missing} messages")
             
             # Only resync very recent messages that are clearly missing
-            recent_missing_gm = [msg for msg in missing_gm if time.time() - msg['timestamp'] > 60 and time.time() - msg['timestamp'] < 300]  # 1-5 minutes old
+            recent_missing_gm = [msg for msg in missing_gm if time.time() - msg['timestamp'] > 60 and time.time() - msg['timestamp'] < 300]
             recent_missing_dc = [msg for msg in missing_dc if time.time() - msg['timestamp'] > 60 and time.time() - msg['timestamp'] < 300]
             
             if recent_missing_gm or recent_missing_dc:
@@ -1679,12 +1585,10 @@ async def sync_history(ctx):
         color=discord.Color.blue()
     )
     
-    # Calculate average sync rate
     avg_sync_rate = sum(h['sync_rate'] for h in history) / len(history)
     embed.add_field(name="📊 Average Sync Rate", value=f"{avg_sync_rate:.1f}%", inline=False)
     
-    # Show recent checks
-    for i, check in enumerate(reversed(history[-5:])):  # Show last 5
+    for i, check in enumerate(reversed(history[-5:])):
         time_str = time.strftime('%H:%M', time.localtime(check['timestamp']))
         status = "✅" if check['sync_rate'] > 95 else "⚠️"
         
@@ -1708,9 +1612,8 @@ async def retry_failed(ctx):
             await ctx.send("✅ No failed messages to retry")
             return
         
-        # Queue all failed messages for retry
         for msg in list(failed_messages):
-            msg['retries'] = 0  # Reset retry count
+            msg['retries'] = 0
             await message_queue.put(msg)
         
         failed_messages.clear()
@@ -1767,7 +1670,7 @@ async def disable_duplicates(ctx, seconds: int = 60):
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    if seconds > 300:  # Max 5 minutes
+    if seconds > 300:
         seconds = 300
     
     duplicate_detector.temporarily_disable(seconds)
@@ -1798,7 +1701,6 @@ async def debug_message(ctx):
     test_msg = f"Debug test message at {time.strftime('%H:%M:%S')}"
     await ctx.send(f"Sending test message: {test_msg}")
     
-    # Queue directly to GroupMe
     await message_queue.put({
         'send_func': send_to_groupme,
         'kwargs': {
@@ -1832,7 +1734,7 @@ def main():
     logger.info("📊 Health monitoring enabled!")
     logger.info("🛡️ Robust multi-layered duplicate detection enabled!")
     logger.info(f"🔍 Sync verification enabled! (every {SYNC_CHECK_INTERVAL//60} minutes)")
-    logger.info(f"🔄 Auto re-queue missing: {'✅' if AUTO_REQUEUE_MISSING else '❌ (DISABLED - prevents spam)'}") 
+    logger.info(f"🔄 Auto re-queue missing: {'✅' if AUTO_REQUEUE_MISSING else '❌ (DISABLED - prevents spam)'}")
     
     # Start webhook server
     webhook_thread = start_webhook_server()
@@ -1852,7 +1754,6 @@ def main():
     except Exception as e:
         logger.error(f"❌ Bot failed to start: {e}")
     finally:
-        # Save any failed messages before exit
         save_failed_messages()
 
 if __name__ == "__main__":
