@@ -1366,78 +1366,65 @@ async def on_ready():
         except:
             pass
 
-# Global message tracking to prevent ANY duplicates
-processed_discord_messages = set()
-processed_groupme_messages = set()
-message_processing_lock = threading.Lock()
+# BULLETPROOF Discord message tracking - MUCH simpler
+discord_message_lock = threading.Lock()
+processed_discord_ids = set()
 
-# Simple but bulletproof duplicate detection
-def is_discord_message_processed(message_id: str) -> bool:
-    """Check if Discord message has been processed"""
-    with message_processing_lock:
-        if message_id in processed_discord_messages:
+def track_discord_message(message_id: str) -> bool:
+    """
+    Track Discord message ID - return True if it's a duplicate
+    This is the ONLY place that should track Discord messages
+    """
+    with discord_message_lock:
+        if message_id in processed_discord_ids:
+            logger.warning(f"🚫 DUPLICATE Discord message blocked: {message_id}")
             return True
-        processed_discord_messages.add(message_id)
-        # Keep only last 1000 messages
-        if len(processed_discord_messages) > 1000:
-            # Remove oldest 200
-            old_messages = list(processed_discord_messages)[:200]
-            processed_discord_messages.difference_update(old_messages)
-        return False
-
-def is_groupme_message_processed(message_id: str) -> bool:
-    """Check if GroupMe message has been processed"""
-    with message_processing_lock:
-        if message_id in processed_groupme_messages:
-            return True
-        processed_groupme_messages.add(message_id)
-        # Keep only last 1000 messages
-        if len(processed_groupme_messages) > 1000:
-            # Remove oldest 200
-            old_messages = list(processed_groupme_messages)[:200]
-            processed_groupme_messages.difference_update(old_messages)
+        
+        processed_discord_ids.add(message_id)
+        
+        # Keep only last 500 messages to prevent memory issues
+        if len(processed_discord_ids) > 500:
+            # Remove oldest 100 messages
+            old_ids = list(processed_discord_ids)[:100]
+            processed_discord_ids.difference_update(old_ids)
+        
+        logger.info(f"✅ NEW Discord message tracked: {message_id}")
         return False
 
 @bot.event
 async def on_message(message):
-    """SIMPLIFIED message handler with bulletproof duplicate detection"""
+    """ULTRA-SIMPLE Discord message handler - no complex logic"""
     try:
-        # Basic filters
-        if message.author.bot or message.channel.id != DISCORD_CHANNEL_ID:
+        # Basic filters - return early for anything we don't want
+        if message.author.bot:
+            await bot.process_commands(message)
+            return
+            
+        if message.channel.id != DISCORD_CHANNEL_ID:
             await bot.process_commands(message)
             return
         
-        # Skip commands
         if message.content.startswith('!'):
             await bot.process_commands(message)
             return
         
         message_id = str(message.id)
-        discord_nickname = message.author.display_name
         
-        # BULLETPROOF duplicate check - if we've seen this message ID, STOP
-        if is_discord_message_processed(message_id):
-            logger.warning(f"🚫 DUPLICATE BLOCKED: Discord message {message_id} already processed")
+        # SINGLE point of duplicate detection - if duplicate, STOP HERE
+        if track_discord_message(message_id):
             await bot.process_commands(message)
             return
         
-        logger.info(f"📨 NEW Discord message: {message_id} from '{discord_nickname}'")
-        
-        # Build content
+        # Get basic info
+        discord_nickname = message.author.display_name
         message_content = message.content or ""
+        
+        # Handle attachments simply
         if message.attachments:
-            attachment_info = []
-            for attachment in message.attachments:
-                if attachment.content_type and attachment.content_type.startswith('image/'):
-                    attachment_info.append("[Image]")
-                else:
-                    attachment_info.append(f"[Attached: {attachment.filename}]")
-            
-            if attachment_info:
-                if message_content:
-                    message_content = f"{message_content} {' '.join(attachment_info)}"
-                else:
-                    message_content = ' '.join(attachment_info)
+            if message_content:
+                message_content += " [Attachment]"
+            else:
+                message_content = "[Attachment]"
         
         # Skip empty messages
         if not message_content.strip():
@@ -1445,21 +1432,20 @@ async def on_message(message):
             await bot.process_commands(message)
             return
         
-        # Handle replies
+        # Simple reply detection
         reply_context = None
         if message.reference and message.reference.message_id:
             try:
                 replied_message = await message.channel.fetch_message(message.reference.message_id)
                 reply_context = {
-                    'text': replied_message.content[:200],
+                    'text': replied_message.content[:100],
                     'name': replied_message.author.display_name,
-                    'type': 'official_reply'
+                    'type': 'reply'
                 }
-                logger.info(f"✅ Reply context found for {message_id}")
             except:
                 pass
         
-        # Store in recent messages
+        # Store in recent messages (for other functions)
         with discord_messages_lock:
             recent_discord_messages.append({
                 'content': message.content,
@@ -1470,8 +1456,9 @@ async def on_message(message):
                 'message_id': message.id
             })
         
-        # Send directly to GroupMe WITHOUT using the queue to avoid duplicates
-        logger.info(f"📤 Sending message {message_id} directly to GroupMe")
+        # Send DIRECTLY to GroupMe - NO complex logic, NO queues, NO additional checks
+        logger.info(f"📤 Sending Discord message {message_id} directly to GroupMe: {message_content[:50]}...")
+        
         success = await send_to_groupme(
             text=message_content,
             author_name=discord_nickname,
@@ -1479,14 +1466,14 @@ async def on_message(message):
         )
         
         if success:
-            logger.info(f"✅ Successfully sent Discord message {message_id} to GroupMe")
+            logger.info(f"✅ Discord message {message_id} sent to GroupMe successfully")
         else:
-            logger.error(f"❌ Failed to send Discord message {message_id} to GroupMe")
+            logger.error(f"❌ Discord message {message_id} failed to send to GroupMe")
         
         await bot.process_commands(message)
         
     except Exception as e:
-        logger.error(f"❌ Error in on_message: {e}")
+        logger.error(f"❌ Error in Discord message handler: {e}")
         await bot.process_commands(message)
 
 @bot.event
