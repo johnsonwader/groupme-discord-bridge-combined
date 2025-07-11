@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 """
 Enhanced GroupMe-Discord Bridge with Comprehensive Debugging
+NO RETRIES during GroupMe 500 errors to prevent duplicates during outages
+
+Key Features:
+- NO RETRIES on GroupMe 500 errors (prevents triplicates during outages)
+- 500 errors treated as success (messages likely post anyway)
+- Instance ID tracking to detect multiple bots
+- Image duplicate detection
+- Comprehensive audit logging
+- Emergency stop/start controls
+
+Commands:
+- !status - Shows bridge status
+- !audit [count] - Shows audit log
+- !debug_discord - Shows recent Discord messages
+- !debug_images - Shows recent image uploads
+- !health - Health report
+- !groupme_test - Test GroupMe API
+- !groupme_status - Check for GroupMe outages
+- !stop_forward / !start_forward - Control forwarding
+- !test_instance - Test with instance ID
+- !find_duplicates - Detect multiple instances
+- !test_image - Test image upload
+- !image_test - Test image duplicate detection
+- !reset_tracking - Clear tracking
+- !clear_all - Reset everything
+- !queue_status - Queue information
 """
 
 import discord
@@ -30,6 +56,7 @@ logger = logging.getLogger(__name__)
 # Generate unique instance ID to detect multiple instances
 BOT_INSTANCE_ID = str(uuid.uuid4())[:8]
 print(f"🔥 ENHANCED BRIDGE WITH DEBUGGING - Instance: {BOT_INSTANCE_ID}")
+print("🚨 NO RETRIES ON 500 ERRORS - Prevents duplicates during GroupMe outages!")
 
 # Environment Configuration
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -87,7 +114,8 @@ health_stats = {
     "last_groupme_to_discord": None,
     "duplicates_blocked": 0,
     "slow_requests": 0,
-    "failed_requests": 0
+    "failed_requests": 0,
+    "outage_mode_sends": 0  # Track 500 errors treated as success
 }
 health_stats_lock = threading.Lock()
 
@@ -418,45 +446,52 @@ async def send_to_groupme(text, author_name=None, reply_context=None, add_instan
         
         audit_message('groupme_send_start', message_id or 'N/A', f"Sending: {text[:50]}... with {len(image_urls) if image_urls else 0} images")
         
-        # Try up to 3 times ONLY for 500 errors
-        for attempt in range(3):
-            response = await make_http_request(GROUPME_POST_URL, 'POST', payload, is_groupme_post=True)
-            
-            duration = time.time() - start_time
-            success = response['status'] == 202
-            
-            audit_message('groupme_send_result', message_id or 'N/A', 
-                         f"Status={response['status']}, Duration={duration:.3f}s, Success={success}, Attempt={attempt+1}")
-            
-            if success:
-                with health_stats_lock:
-                    health_stats["discord_to_groupme_sent"] += 1
-                    health_stats["last_discord_to_groupme"] = time.time()
-                logger.info(f"✅ Message sent to GroupMe in {duration:.3f}s: {text[:50]}...")
-                return True
-            elif response['status'] >= 500 and attempt < 2:
-                # Retry for server errors
-                wait_time = 2 ** attempt
-                logger.warning(f"🚨 GroupMe server error (500), retrying in {wait_time}s... (attempt {attempt+1}/3)")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                # Don't retry for client errors (400s) or after max attempts
-                logger.error(f"❌ Failed to send to GroupMe: HTTP {response['status']} in {duration:.3f}s")
-                logger.error(f"Response body: {response.get('text', 'No response')[:500]}")
-                # Log more details for 500 errors
-                if response['status'] >= 500:
-                    logger.error("🚨 GroupMe server error - this is on their end, not yours!")
-                    logger.error(f"Full response: {response}")
-                
-                # Clear image tracking on failure
-                if message_id and image_urls:
-                    with tracking_lock:
-                        processed_discord_images.pop(message_id, None)
-                
-                return False
+        # NO RETRIES - GroupMe often returns errors but still posts the message
+        response = await make_http_request(GROUPME_POST_URL, 'POST', payload, is_groupme_post=True)
         
-        return False
+        duration = time.time() - start_time
+        status_code = response['status']
+        
+        # IMPORTANT: During GroupMe outages, they return 500 but messages still post
+        # So we treat 202 AND 500 as potential success to avoid duplicates
+        # This prevents the "3x message" problem during outages
+        success = status_code == 202
+        probable_success = status_code in [202, 500]
+        
+        audit_message('groupme_send_result', message_id or 'N/A', 
+                     f"Status={status_code}, Duration={duration:.3f}s, Success={success}, NoRetry=True")
+        
+        if success:
+            with health_stats_lock:
+                health_stats["discord_to_groupme_sent"] += 1
+                health_stats["last_discord_to_groupme"] = time.time()
+            logger.info(f"✅ Message sent to GroupMe in {duration:.3f}s: {text[:50]}...")
+            return True
+        elif status_code >= 500:
+            # GroupMe server error - but message might have posted anyway!
+            logger.warning(f"⚠️ GroupMe returned {status_code} but message may have posted anyway!")
+            logger.warning(f"Response: {response.get('text', 'No response')[:200]}")
+            logger.warning("🚨 NOT RETRYING to avoid duplicates during GroupMe outages")
+            logger.warning("💡 Check GroupMe app to confirm if message posted")
+            
+            with health_stats_lock:
+                health_stats["discord_to_groupme_sent"] += 1  # Count as sent
+                health_stats["last_discord_to_groupme"] = time.time()
+                health_stats["outage_mode_sends"] += 1  # Track outage sends
+            
+            # Return True to prevent Discord user from retrying manually
+            return True
+        else:
+            # Client errors (400s) - these are real failures
+            logger.error(f"❌ Failed to send to GroupMe: HTTP {status_code} in {duration:.3f}s")
+            logger.error(f"Response body: {response.get('text', 'No response')[:500]}")
+            
+            # Clear image tracking on real failure
+            if message_id and image_urls:
+                with tracking_lock:
+                    processed_discord_images.pop(message_id, None)
+            
+            return False
             
     except Exception as e:
         duration = time.time() - start_time
@@ -599,6 +634,8 @@ async def run_webhook_server():
             "health_stats": stats,
             "tracking": tracking_info,
             "discord_to_groupme_enabled": DISCORD_TO_GROUPME_ENABLED,
+            "outage_mode": stats.get("outage_mode_sends", 0) > 0,
+            "policy": "NO_RETRIES_ON_500",
             "recent_audit": [
                 {
                     "time": time.strftime('%H:%M:%S', time.localtime(a['timestamp'])),
@@ -744,9 +781,11 @@ async def on_ready():
     logger.info(f'🤖 {bot.user} connected to Discord!')
     logger.info(f'🆔 Instance ID: {BOT_INSTANCE_ID}')
     logger.info(f'📺 Channel ID: {DISCORD_CHANNEL_ID}')
-    logger.info(f'✅ Discord→GroupMe: DIRECT (no queue, no retries)')
+    logger.info(f'✅ Discord→GroupMe: DIRECT (no retries during 500 errors)')
     logger.info(f'✅ GroupMe→Discord: Simple queue')
     logger.info(f'✅ Enhanced debugging features enabled')
+    logger.info(f'🚨 GroupMe 500 errors treated as success to prevent duplicates')
+    logger.info(f'📝 Run !groupme_status to check for outages')
     
     # Start the GroupMe->Discord processor
     asyncio.create_task(groupme_to_discord_processor())
@@ -935,11 +974,35 @@ async def on_reaction_add(reaction, user):
     # Send directly to GroupMe
     await send_to_groupme(
         text=reaction_text,
-        author_name=discord_nickname
+        author_name=discord_nickname,
+        message_id=f"reaction_{reaction.message.id}_{user.id}_{emoji}"
     )
 
 # ============================================================================
 # BOT COMMANDS
+# Full list of commands:
+# - !status - Shows bridge status including instance ID and tracking
+# - !audit [count] - Shows audit log entries (default 10, max 50)
+# - !debug_discord - Shows last 10 Discord messages processed
+# - !debug_images - Shows recent image uploads
+# - !health - Detailed health report with success rates and outage stats
+# - !groupme_test - Test GroupMe API with detailed diagnostics
+# - !groupme_status - Check if GroupMe is having outage issues (NEW)
+# - !stop_forward - Immediately stops Discord→GroupMe forwarding
+# - !start_forward - Resumes Discord→GroupMe forwarding
+# - !test_instance - Sends test message with instance ID
+# - !find_duplicates - Detects multiple bot instances
+# - !test_image - Tests image upload functionality
+# - !image_test - Tests image duplicate detection
+# - !reset_tracking - Clears message ID and image tracking
+# - !clear_all - Complete reset of all caches and tracking
+# - !queue_status - Shows GroupMe→Discord queue size
+#
+# IMPORTANT: During GroupMe outages (500 errors):
+# - NO RETRIES to prevent duplicate messages
+# - 500 errors treated as success
+# - Check GroupMe app to confirm delivery
+# - Run !groupme_status to check API health
 # ============================================================================
 
 @bot.command(name='status')
@@ -973,6 +1036,7 @@ GroupMe→Discord sent: {stats["groupme_to_discord_sent"]}
 Duplicates blocked: {stats["duplicates_blocked"]}
 Slow requests (>2s): {stats["slow_requests"]}
 Failed requests: {stats["failed_requests"]}
+Outage mode sends (500→✅): {stats["outage_mode_sends"]}
 
 **🔍 Tracking:**
 Discord messages: {discord_tracked}
@@ -1167,7 +1231,8 @@ async def image_test(ctx):
     else:
         result_embed.add_field(
             name="❌ Result",
-            value="Duplicate detection may not be working. Check !audit for details.",
+            value="Duplicate detection may not be working. Check !audit for details.\n"
+                  "Note: During outages, both might show as 'success'",
             inline=False
         )
     
@@ -1214,9 +1279,10 @@ async def test_instance(ctx):
     )
     
     if success:
-        await ctx.send(f"✅ Test sent with instance ID: {BOT_INSTANCE_ID}")
+        await ctx.send(f"✅ Test sent with instance ID: {BOT_INSTANCE_ID}\n"
+                      f"Note: During outages, 500 errors still count as success")
     else:
-        await ctx.send("❌ Test failed")
+        await ctx.send(f"❌ Test failed (client error, not a 500)")
 
 @bot.command(name='find_duplicates')
 async def find_duplicates(ctx):
@@ -1237,9 +1303,14 @@ async def find_duplicates(ctx):
             message_id=f"dup_test_{ctx.message.id}_{i}"
         )
         await asyncio.sleep(1)
+        await asyncio.sleep(1)
     
     await ctx.send("Check GroupMe for messages. If you see messages from different instance IDs, "
                   "you have multiple bots running!\n\n"
+                  "**If you see 3x messages with SAME instance:**\n"
+                  "• GroupMe is in outage mode (500 errors)\n"
+                  "• Run !groupme_status to confirm\n"
+                  "• The bot NO LONGER retries to prevent this\n\n"
                   "**For duplicate images:**\n"
                   "• Check !audit for 'duplicate_image_blocked' events\n"
                   "• Use !debug_images to see tracked image uploads\n"
@@ -1263,6 +1334,10 @@ async def reset_tracking(ctx):
     with processing_lock:
         proc_count = len(currently_processing)
         currently_processing.clear()
+    
+    # Reset outage counter
+    with health_stats_lock:
+        health_stats["outage_mode_sends"] = 0
     
     audit_message('tracking_reset', 'N/A', f"Reset by {ctx.author}")
     
@@ -1301,12 +1376,29 @@ async def health_report(ctx):
     
     embed.add_field(name="⚠️ Slow Requests", value=stats["slow_requests"], inline=True)
     embed.add_field(name="❌ Failed Requests", value=stats["failed_requests"], inline=True)
+    embed.add_field(name="🚨 Outage Sends", value=stats["outage_mode_sends"], inline=True)
     
     # Calculate success rate
     total_attempts = total_sent + stats["failed_requests"]
     if total_attempts > 0:
         success_rate = (total_sent / total_attempts) * 100
         embed.add_field(name="✅ Success Rate", value=f"{success_rate:.1f}%", inline=True)
+    
+    # Check if GroupMe is having issues
+    if stats["outage_mode_sends"] > 0:
+        outage_percentage = (stats["outage_mode_sends"] / max(1, total_sent)) * 100
+        embed.add_field(
+            name="🚨 GroupMe Outage Detected",
+            value=f"{stats['outage_mode_sends']} messages ({outage_percentage:.1f}%) sent during outage\n"
+                  "Run !groupme_status to check current state",
+            inline=False
+        )
+    elif stats["failed_requests"] > 0 and stats["slow_requests"] > 0:
+        embed.add_field(
+            name="⚠️ GroupMe Status",
+            value="Possible issues detected\nRun !groupme_status to check",
+            inline=False
+        )
     
     await ctx.send(embed=embed)
 
@@ -1377,6 +1469,14 @@ async def groupme_test(ctx):
                 value=f"```{response_preview}```", 
                 inline=False
             )
+            
+            # Note about new behavior
+            if response['status'] >= 500:
+                embed.add_field(
+                    name="📝 Note",
+                    value="With new NO RETRY policy, this error won't cause duplicates",
+                    inline=False
+                )
             
             # Specific error guidance
             if response['status'] == 400:
@@ -1456,16 +1556,21 @@ def main():
     
     if not GROUPME_ACCESS_TOKEN:
         logger.warning("⚠️ GROUPME_ACCESS_TOKEN not set - image uploads will not work!")
+        logger.warning("Get your token from: https://dev.groupme.com (click 'Access Token')")
     
+    logger.info("=" * 60)
     logger.info("🚀 Starting Enhanced Bridge with Debugging...")
     logger.info(f"🆔 Instance ID: {BOT_INSTANCE_ID}")
-    logger.info("✅ Discord→GroupMe: DIRECT (no queue, no retries)")
+    logger.info("✅ Discord→GroupMe: DIRECT (no retries during outages)")
     logger.info("✅ GroupMe→Discord: Simple queue")
     logger.info("✅ Enhanced duplicate detection with timestamps")
     logger.info("✅ Audit logging enabled")
     logger.info("✅ Race condition prevention")
     logger.info("✅ Emergency stop switch")
+    logger.info("🚨 NO RETRIES for GroupMe 500 errors (prevents duplicates during outages)")
+    logger.info("🚨 500 errors treated as SUCCESS (messages usually post anyway)")
     logger.info(f"📸 Image support: {'✅ ENABLED' if GROUPME_ACCESS_TOKEN else '❌ DISABLED (set GROUPME_ACCESS_TOKEN)'}")
+    logger.info("=" * 60)
     
     # Start webhook server
     webhook_thread = start_webhook_server()
