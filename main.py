@@ -905,8 +905,14 @@ async def convert_discord_mentions_to_nicknames(text):
 
 # Message sending functions
 async def send_to_groupme(text, author_name=None, reply_context=None):
-    """Send message to GroupMe with retry logic"""
+    """Send message to GroupMe with proper API handling"""
     try:
+        # Check if GroupMe is properly configured
+        if not GROUPME_BOT_ID:
+            logger.error("❌ GROUPME_BOT_ID not configured")
+            return False
+        
+        # Convert Discord mentions
         text = await convert_discord_mentions_to_nicknames(text)
         
         if reply_context:
@@ -919,16 +925,34 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
             if author_name and not text.startswith(author_name):
                 text = f"{author_name}: {text}" if text.strip() else f"{author_name} sent content"
         
+        # GroupMe has message length limits
+        if len(text) > 1000:
+            text = text[:997] + "..."
+        
         payload = {"bot_id": GROUPME_BOT_ID, "text": text}
+        
+        logger.debug(f"Sending to GroupMe: {payload}")
         response = await make_http_request(GROUPME_POST_URL, 'POST', payload)
         
+        # GroupMe bot API returns 202 for success
         success = response['status'] == 202
         update_health_stats(success)
         
         if success:
             logger.info(f"✅ Message sent to GroupMe: {text[:50]}...")
         else:
-            logger.error(f"❌ Failed to send to GroupMe: {response['status']}")
+            logger.error(f"❌ Failed to send to GroupMe: HTTP {response['status']}")
+            logger.error(f"Response: {response.get('text', 'No response text')[:200]}")
+            
+            # Log specific error cases
+            if response['status'] == 400:
+                logger.error("Bad request - check bot_id and message format")
+            elif response['status'] == 401:
+                logger.error("Unauthorized - check GroupMe bot configuration")
+            elif response['status'] == 404:
+                logger.error("Not found - bot or group may not exist")
+            elif response['status'] >= 500:
+                logger.error("GroupMe server error - temporary issue")
             
         return success
             
@@ -1669,6 +1693,35 @@ async def duplicate_stats(ctx):
     
     await ctx.send(embed=embed)
 
+@bot.command(name='fix_async')
+async def fix_async_context(ctx):
+    """Try to fix async context issues"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    await ctx.send("🔧 Attempting to fix async context issues...")
+    
+    # Test basic async operations
+    try:
+        # Test aiohttp
+        test_url = "https://httpbin.org/get"
+        response = await make_http_request(test_url)
+        if response['status'] == 200:
+            await ctx.send("✅ HTTP requests working")
+        else:
+            await ctx.send(f"⚠️ HTTP test returned status {response['status']}")
+    except Exception as e:
+        await ctx.send(f"❌ HTTP test failed: {e}")
+    
+    # Test Discord operations
+    try:
+        test_embed = discord.Embed(title="Test Embed", description="Testing Discord operations")
+        await ctx.send("✅ Discord operations working", embed=test_embed)
+    except Exception as e:
+        await ctx.send(f"❌ Discord test failed: {e}")
+    
+    await ctx.send("🔧 Async context test complete. Check logs for any remaining issues.")
+
 @bot.command(name='sync')
 async def check_sync(ctx):
     """Manually run sync verification"""
@@ -2193,34 +2246,105 @@ async def emergency_reset(ctx):
     await ctx.send("✅ Emergency reset complete! All systems cleared.")
     await ctx.send("Try sending a test message now.")
 
-@bot.command(name='fix_async')
-async def fix_async_context(ctx):
-    """Try to fix async context issues"""
+@bot.command(name='test_groupme_send')
+async def test_groupme_send(ctx):
+    """Test sending a message to GroupMe (internal test)"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
-    await ctx.send("🔧 Attempting to fix async context issues...")
+    await ctx.send("🧪 Testing GroupMe send function...")
     
-    # Test basic async operations
+    test_message = f'Test message from Discord at {time.strftime("%H:%M:%S")}'
+    
     try:
-        # Test aiohttp
-        test_url = "https://httpbin.org/get"
-        response = await make_http_request(test_url)
-        if response['status'] == 200:
-            await ctx.send("✅ HTTP requests working")
+        success = await send_to_groupme(
+            text=test_message,
+            author_name='TEST_USER'
+        )
+        if success:
+            await ctx.send("✅ GroupMe send function working correctly!")
+            await ctx.send("Check GroupMe to see if the test message appeared.")
         else:
-            await ctx.send(f"⚠️ HTTP test returned status {response['status']}")
+            await ctx.send("❌ GroupMe send function failed!")
     except Exception as e:
-        await ctx.send(f"❌ HTTP test failed: {e}")
+        await ctx.send(f"❌ GroupMe send function error: {e}")
+
+@bot.command(name='test_groupme_api')
+async def test_groupme_api(ctx):
+    """Test GroupMe API directly"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
     
-    # Test Discord operations
+    await ctx.send("🧪 Testing GroupMe API directly...")
+    
+    test_payload = {
+        "bot_id": GROUPME_BOT_ID,
+        "text": f"Direct API test at {time.strftime('%H:%M:%S')}"
+    }
+    
     try:
-        test_embed = discord.Embed(title="Test Embed", description="Testing Discord operations")
-        await ctx.send("✅ Discord operations working", embed=test_embed)
+        response = await make_http_request(GROUPME_POST_URL, 'POST', test_payload)
+        
+        embed = discord.Embed(
+            title="🔍 GroupMe API Test Results",
+            color=discord.Color.green() if response['status'] == 202 else discord.Color.red()
+        )
+        
+        embed.add_field(name="Status Code", value=response['status'], inline=True)
+        embed.add_field(name="Success", value="✅ Yes" if response['status'] == 202 else "❌ No", inline=True)
+        
+        response_text = response.get('text', 'No response')[:500]
+        embed.add_field(name="Response", value=f"```{response_text}```", inline=False)
+        
+        if response['status'] == 202:
+            embed.add_field(name="Note", value="202 status is success for GroupMe bot API", inline=False)
+        
+        await ctx.send(embed=embed)
+        
     except Exception as e:
-        await ctx.send(f"❌ Discord test failed: {e}")
+        await ctx.send(f"❌ GroupMe API test failed: {e}")
+
+@bot.command(name='check_groupme_config')
+async def check_groupme_config(ctx):
+    """Check GroupMe configuration"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
     
-    await ctx.send("🔧 Async context test complete. Check logs for any remaining issues.")
+    embed = discord.Embed(
+        title="⚙️ GroupMe Configuration",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="Bot ID", 
+        value="✅ Set" if GROUPME_BOT_ID else "❌ Missing", 
+        inline=True
+    )
+    embed.add_field(
+        name="Access Token", 
+        value="✅ Set" if GROUPME_ACCESS_TOKEN else "❌ Missing", 
+        inline=True
+    )
+    embed.add_field(
+        name="Group ID", 
+        value="✅ Set" if GROUPME_GROUP_ID else "❌ Missing", 
+        inline=True
+    )
+    
+    if GROUPME_BOT_ID:
+        embed.add_field(
+            name="Bot ID (partial)", 
+            value=f"{GROUPME_BOT_ID[:8]}...", 
+            inline=True
+        )
+    
+    embed.add_field(
+        name="API Endpoint", 
+        value=GROUPME_POST_URL, 
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
 
 # Main Function with improved async handling
 def main():
