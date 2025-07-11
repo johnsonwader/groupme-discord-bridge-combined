@@ -938,8 +938,13 @@ async def send_to_groupme(text, author_name=None, reply_context=None):
         return False
 
 async def send_to_discord(message, reply_context=None):
-    """Send message to Discord with retry logic"""
+    """Send message to Discord with proper async handling"""
     try:
+        # Ensure we're in a proper async context
+        if not bot.is_ready():
+            logger.warning("Bot not ready, cannot send to Discord")
+            return False
+            
         discord_channel = bot.get_channel(DISCORD_CHANNEL_ID)
         if not discord_channel:
             logger.error(f"Discord channel {DISCORD_CHANNEL_ID} not found")
@@ -954,29 +959,63 @@ async def send_to_discord(message, reply_context=None):
             preview = original_text[:200] + '...' if len(original_text) > 200 else original_text
             content = f"↪️ **{author}** replying to **{original_author}**:\n> {preview}\n\n{content}"
         
-        # Handle images
+        # Handle images with proper error handling
         embeds = []
-        if message.get('attachments'):
-            for attachment in message['attachments']:
-                if attachment.get('type') == 'image' and attachment.get('url'):
-                    embeds.append(discord.Embed().set_image(url=attachment['url']))
+        try:
+            if message.get('attachments'):
+                for attachment in message['attachments']:
+                    if attachment.get('type') == 'image' and attachment.get('url'):
+                        embed = discord.Embed()
+                        embed.set_image(url=attachment['url'])
+                        embeds.append(embed)
+        except Exception as e:
+            logger.warning(f"Error processing attachments: {e}")
         
-        formatted_content = f"**{author}:** {content}" if content else f"**{author}** sent an attachment"
-        sent_message = await discord_channel.send(formatted_content, embeds=embeds)
-        
-        if message.get('id'):
-            with mapping_lock:
-                message_mapping[sent_message.id] = message['id']
-            with cache_lock:
-                reply_context_cache[message['id']] = {
-                    **message,
-                    'discord_message_id': sent_message.id,
-                    'processed_timestamp': time.time()
-                }
-        
-        update_health_stats(True)
-        logger.info(f"✅ Message sent to Discord: {content[:50]}...")
-        return True
+        # Send message with proper error handling
+        try:
+            formatted_content = f"**{author}:** {content}" if content else f"**{author}** sent an attachment"
+            
+            # Ensure content isn't too long for Discord
+            if len(formatted_content) > 2000:
+                formatted_content = formatted_content[:1997] + "..."
+            
+            # Use asyncio.wait_for to prevent hanging
+            sent_message = await asyncio.wait_for(
+                discord_channel.send(formatted_content, embeds=embeds),
+                timeout=10.0  # 10 second timeout
+            )
+            
+            # Store mapping with thread safety
+            if message.get('id'):
+                with mapping_lock:
+                    message_mapping[sent_message.id] = message['id']
+                with cache_lock:
+                    reply_context_cache[message['id']] = {
+                        **message,
+                        'discord_message_id': sent_message.id,
+                        'processed_timestamp': time.time()
+                    }
+            
+            update_health_stats(True)
+            logger.info(f"✅ Message sent to Discord: {content[:50]}...")
+            return True
+            
+        except asyncio.TimeoutError:
+            logger.error("❌ Discord send timeout after 10 seconds")
+            update_health_stats(False)
+            return False
+        except discord.HTTPException as e:
+            logger.error(f"❌ Discord HTTP error: {e}")
+            update_health_stats(False)
+            return False
+        except discord.Forbidden as e:
+            logger.error(f"❌ Discord permission error: {e}")
+            update_health_stats(False)
+            return False
+        except Exception as e:
+            logger.error(f"❌ Discord send error: {e}")
+            update_health_stats(False)
+            return False
         
     except Exception as e:
         logger.error(f"❌ Failed to send to Discord: {e}")
@@ -1128,7 +1167,7 @@ async def run_webhook_server():
         })
     
     async def groupme_webhook(request):
-        """SIMPLIFIED webhook handler with bulletproof duplicate detection"""
+        """SIMPLIFIED webhook handler with proper async context"""
         start_time = time.time()
         
         try:
@@ -1162,20 +1201,50 @@ async def run_webhook_server():
                 with cache_lock:
                     reply_context_cache[message_id] = data
             
-            # Check if bot is ready
+            # Check if bot is ready with timeout
             if not bot.is_ready():
                 logger.warning("⏳ Bot not ready, waiting...")
-                ready = await wait_for_bot_ready(timeout=5)
+                ready = await wait_for_bot_ready(timeout=3)  # Reduced timeout
                 if not ready:
-                    logger.error("❌ Bot still not ready after timeout")
-                    return web.json_response({"status": "error", "reason": "bot_not_ready"})
+                    logger.error("❌ Bot still not ready, queueing for later")
+                    # Queue for later processing instead of failing
+                    await message_queue.put({
+                        'send_func': send_to_discord,
+                        'kwargs': {'message': data, 'reply_context': None},
+                        'type': 'groupme_to_discord_delayed',
+                        'retries': 0,
+                        'original_data': data
+                    })
+                    return web.json_response({"status": "queued", "reason": "bot_not_ready"})
             
-            # Detect reply context
-            reply_context = await detect_reply_context(data)
+            # Detect reply context with timeout
+            try:
+                reply_context = await asyncio.wait_for(
+                    detect_reply_context(data),
+                    timeout=2.0  # 2 second timeout for reply detection
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Reply context detection timed out, proceeding without")
+                reply_context = None
+            except Exception as e:
+                logger.warning(f"Reply context detection error: {e}")
+                reply_context = None
             
-            # Send directly to Discord WITHOUT using the queue
+            # Send directly to Discord with timeout protection
             logger.info(f"📤 Sending GroupMe message {message_id} directly to Discord")
-            success = await send_to_discord(data, reply_context)
+            
+            try:
+                # Use asyncio.wait_for to prevent hanging
+                success = await asyncio.wait_for(
+                    send_to_discord(data, reply_context),
+                    timeout=15.0  # 15 second total timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"❌ Discord send timeout for message {message_id}")
+                success = False
+            except Exception as e:
+                logger.error(f"❌ Discord send error for message {message_id}: {e}")
+                success = False
             
             processing_time = time.time() - start_time
             logger.info(f"⏱️ GroupMe webhook processed in {processing_time:.3f}s")
@@ -1185,8 +1254,20 @@ async def run_webhook_server():
                 return web.json_response({"status": "success"})
             else:
                 logger.error(f"❌ Failed to send GroupMe message {message_id} to Discord")
-                return web.json_response({"status": "failed"})
+                # Queue for retry instead of failing completely
+                await message_queue.put({
+                    'send_func': send_to_discord,
+                    'kwargs': {'message': data, 'reply_context': reply_context},
+                    'type': 'groupme_to_discord_retry',
+                    'retries': 0,
+                    'original_data': data
+                })
+                return web.json_response({"status": "queued_for_retry"})
             
+        except asyncio.TimeoutError:
+            processing_time = time.time() - start_time
+            logger.error(f"❌ Webhook processing timeout ({processing_time:.3f}s)")
+            return web.json_response({"error": "Processing timeout"}, status=408)
         except Exception as e:
             processing_time = time.time() - start_time
             logger.error(f"❌ Error handling GroupMe webhook ({processing_time:.3f}s): {e}")
@@ -1993,6 +2074,62 @@ async def test_simple_discord(ctx):
     else:
         await ctx.send("❌ Direct send failed")
 
+@bot.command(name='test_discord_send')
+async def test_discord_send(ctx):
+    """Test sending a message to Discord (internal test)"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    await ctx.send("🧪 Testing Discord send function...")
+    
+    # Create a fake GroupMe message to test the send_to_discord function
+    test_message = {
+        'id': f'test_{int(time.time())}',
+        'text': f'Test message from GroupMe at {time.strftime("%H:%M:%S")}',
+        'name': 'TEST_USER',
+        'attachments': []
+    }
+    
+    try:
+        success = await send_to_discord(test_message)
+        if success:
+            await ctx.send("✅ Discord send function working correctly!")
+        else:
+            await ctx.send("❌ Discord send function failed!")
+    except Exception as e:
+        await ctx.send(f"❌ Discord send function error: {e}")
+
+@bot.command(name='bot_status')
+async def bot_status_check(ctx):
+    """Check bot connection status"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    embed = discord.Embed(
+        title="🤖 Bot Status Check",
+        color=discord.Color.green() if bot.is_ready() else discord.Color.red()
+    )
+    
+    embed.add_field(name="Bot Ready", value="✅ Yes" if bot.is_ready() else "❌ No", inline=True)
+    embed.add_field(name="Bot User", value=str(bot.user) if bot.user else "None", inline=True)
+    embed.add_field(name="Latency", value=f"{bot.latency*1000:.1f}ms", inline=True)
+    
+    embed.add_field(name="Channel Access", value="✅ Yes" if ctx.channel else "❌ No", inline=True)
+    embed.add_field(name="Channel ID", value=str(DISCORD_CHANNEL_ID), inline=True)
+    embed.add_field(name="Guild", value=str(ctx.guild.name) if ctx.guild else "DM", inline=True)
+    
+    try:
+        # Test sending a simple message
+        test_start = time.time()
+        test_msg = await ctx.send("Testing message send speed...")
+        test_time = time.time() - test_start
+        await test_msg.edit(content=f"✅ Message send test: {test_time:.3f}s")
+        embed.add_field(name="Send Test", value=f"✅ {test_time:.3f}s", inline=True)
+    except Exception as e:
+        embed.add_field(name="Send Test", value=f"❌ {str(e)}", inline=True)
+    
+    await ctx.send(embed=embed)
+
 @bot.command(name='disable_complex')
 async def disable_complex_detection(ctx):
     """Disable the complex duplicate detector entirely"""
@@ -2007,7 +2144,7 @@ async def disable_complex_detection(ctx):
 
 @bot.command(name='queue_status')
 async def queue_status(ctx):
-    """Show queue status - should be empty now"""
+    """Show queue status - should be mostly empty now"""
     if ctx.channel.id != DISCORD_CHANNEL_ID:
         return
     
@@ -2015,11 +2152,79 @@ async def queue_status(ctx):
         queue_size = health_stats["queue_size"]
     
     await ctx.send(f"📬 Message queue size: {queue_size}\n"
-                  f"Note: Normal messages now bypass the queue to prevent duplicates.")
+                  f"Note: Normal messages now bypass the queue to prevent duplicates.\n"
+                  f"Queue is only used for retries and special functions.")
 
-# Main Function
+@bot.command(name='emergency_reset')
+async def emergency_reset(ctx):
+    """Emergency reset of all systems"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    await ctx.send("🚨 EMERGENCY RESET - Clearing all caches and state...")
+    
+    # Reset simple tracking
+    with message_processing_lock:
+        processed_discord_messages.clear()
+        processed_groupme_messages.clear()
+    
+    # Reset complex detection
+    duplicate_detector.reset_all_caches()
+    
+    # Clear message queues
+    try:
+        while not message_queue.empty():
+            message_queue.get_nowait()
+    except:
+        pass
+    
+    # Clear recent messages
+    with discord_messages_lock:
+        recent_discord_messages.clear()
+    with groupme_messages_lock:
+        recent_groupme_messages.clear()
+    
+    # Clear caches
+    with cache_lock:
+        reply_context_cache.clear()
+    with mapping_lock:
+        message_mapping.clear()
+    
+    await ctx.send("✅ Emergency reset complete! All systems cleared.")
+    await ctx.send("Try sending a test message now.")
+
+@bot.command(name='fix_async')
+async def fix_async_context(ctx):
+    """Try to fix async context issues"""
+    if ctx.channel.id != DISCORD_CHANNEL_ID:
+        return
+    
+    await ctx.send("🔧 Attempting to fix async context issues...")
+    
+    # Test basic async operations
+    try:
+        # Test aiohttp
+        test_url = "https://httpbin.org/get"
+        response = await make_http_request(test_url)
+        if response['status'] == 200:
+            await ctx.send("✅ HTTP requests working")
+        else:
+            await ctx.send(f"⚠️ HTTP test returned status {response['status']}")
+    except Exception as e:
+        await ctx.send(f"❌ HTTP test failed: {e}")
+    
+    # Test Discord operations
+    try:
+        test_embed = discord.Embed(title="Test Embed", description="Testing Discord operations")
+        await ctx.send("✅ Discord operations working", embed=test_embed)
+    except Exception as e:
+        await ctx.send(f"❌ Discord test failed: {e}")
+    
+    await ctx.send("🔧 Async context test complete. Check logs for any remaining issues.")
+
+# Main Function with improved async handling
 def main():
-    """Enhanced main entry point"""
+    """Enhanced main entry point with proper async context"""
     if not DISCORD_BOT_TOKEN:
         logger.error("❌ DISCORD_BOT_TOKEN required!")
         return
@@ -2043,24 +2248,53 @@ def main():
     logger.info(f"🔄 Auto re-queue missing: {'✅' if AUTO_REQUEUE_MISSING else '❌ (DISABLED - prevents spam)'}")
     logger.info("⚡ DIRECT FLOW: Normal messages bypass queue to eliminate duplicates!")
     
-    # Start webhook server
+    # Start webhook server in a separate thread
     webhook_thread = start_webhook_server()
     time.sleep(2)
     
-    # Start bot with tasks
+    # Start bot with proper async context
     try:
+        # Create new event loop for the bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Create tasks
-        loop.create_task(enhanced_cleanup())
-        loop.create_task(health_monitor())
+        async def run_bot_with_tasks():
+            """Run bot with background tasks"""
+            try:
+                # Start background tasks
+                loop.create_task(enhanced_cleanup())
+                loop.create_task(health_monitor())
+                loop.create_task(message_queue_processor())  # Still needed for retries
+                loop.create_task(sync_verification_task())
+                
+                # Start the bot
+                await bot.start(DISCORD_BOT_TOKEN)
+                
+            except Exception as e:
+                logger.error(f"❌ Bot startup error: {e}")
+                raise
         
-        # Run bot
-        bot.run(DISCORD_BOT_TOKEN)
+        # Run the bot with tasks
+        try:
+            loop.run_until_complete(run_bot_with_tasks())
+        except KeyboardInterrupt:
+            logger.info("🛑 Received interrupt signal, shutting down...")
+        except Exception as e:
+            logger.error(f"❌ Bot runtime error: {e}")
+        finally:
+            # Cleanup
+            save_failed_messages()
+            logger.info("💾 Saved any pending data")
+            
+            # Close the bot properly
+            if not bot.is_closed():
+                loop.run_until_complete(bot.close())
+            
+            loop.close()
+            logger.info("🔚 Bot shutdown complete")
+            
     except Exception as e:
-        logger.error(f"❌ Bot failed to start: {e}")
-    finally:
+        logger.error(f"❌ Critical startup error: {e}")
         save_failed_messages()
 
 if __name__ == "__main__":
